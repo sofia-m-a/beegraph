@@ -1,0 +1,4 @@
+.direnv
+direnv
+dist-newstyle
+dist*

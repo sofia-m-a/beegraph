@@ -1,0 +1,116 @@
+cabal-version:      2.4
+name:               pltest
+version:            0.1.0.0
+license:            MIT
+copyright:          2021 Sofia M.A
+maintainer:         sofia.ma@protonmail.com
+author:             Sofia M.A
+-- category:         
+-- synopsis:
+-- description:
+-- bug-reports:
+
+extra-source-files:
+  LICENSE
+  README.md
+
+executable flaker
+  build-depends:
+    , base
+    , bytestring
+    , charset
+    , containers
+    , data-fix
+    , functor-combinators
+    , haskeline
+    , lens
+    , mtl
+    , optparse-applicative
+    , prettyprinter
+    , profunctors
+    , recursion-schemes
+    , relude
+    , shower
+    , streamly
+    -- , souffle-dsl
+    , souffle-haskell
+    , tagged
+    , text
+    , time
+    , trifecta
+    , vector
+    , witherable
+
+  mixins:
+    base hiding (Prelude),
+    relude (Relude as Prelude, Relude.Container.One),
+    relude
+
+  ghc-options:
+    -Wall -Wincomplete-record-updates -Wincomplete-uni-patterns
+
+  default-extensions:
+    ApplicativeDo
+    BangPatterns
+    BinaryLiterals
+    BlockArguments
+    ConstrainedClassMethods
+    ConstraintKinds
+    DataKinds
+    DefaultSignatures
+    DeriveFoldable
+    DeriveFunctor
+    DeriveGeneric
+    DeriveTraversable
+    DerivingStrategies
+    DerivingVia
+    EmptyCase
+    EmptyDataDecls
+    EmptyDataDeriving
+    ExistentialQuantification
+    ExplicitForAll
+    ExplicitNamespaces
+    FunctionalDependencies
+    GADTs
+    GeneralisedNewtypeDeriving
+    HexFloatLiterals
+    InstanceSigs
+    KindSignatures
+    LambdaCase
+    LiberalTypeSynonyms
+    MonadComprehensions
+    NoMonomorphismRestriction
+    MultiParamTypeClasses
+    MultiWayIf
+    NegativeLiterals
+    NumDecimals
+    NumericUnderscores
+    OverloadedLists
+    OverloadedStrings
+    ParallelListComp
+    PartialTypeSignatures
+    PatternGuards
+    PatternSynonyms
+    PolyKinds
+    RankNTypes
+    ScopedTypeVariables
+    StandaloneDeriving
+    NoStarIsType
+    TupleSections
+    TypeApplications
+    TypeFamilies
+    TypeFamilyDependencies
+    TypeInType
+    TypeOperators
+    UnicodeSyntax
+    ViewPatterns
+
+  main-is:            Main.hs
+  extra_modules:      BF.hs
+  cxx-options:
+    -D__EMBEDDED_SOUFFLE__
+    -std=c++17
+  cxx-sources:
+    src/sema.cpp
+  hs-source-dirs:     src
+  default-language:   Haskell2010

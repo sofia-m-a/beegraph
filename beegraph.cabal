@@ -35,7 +35,8 @@ executable beegraph
     , prettyprinter
     , profunctors
     , recursion-schemes
-    , sofialude
+    , relude
+    --, sofialude
     , semialign
     , smash
     , souffle-haskell
@@ -44,6 +45,7 @@ executable beegraph
     , text
     , these
     , time
+    , transformers
     , trifecta
     , unordered-containers
     , validation
@@ -51,7 +53,8 @@ executable beegraph
     
   mixins:
     base hiding (Prelude),
-    sofialude (Sofialude as Prelude)
+    relude (Relude as Prelude)
+    -- sofialude (Sofialude as Prelude)
 
   ghc-options:
     -Wall -Wincomplete-record-updates -Wincomplete-uni-patterns

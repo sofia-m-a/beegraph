@@ -1,11 +1,15 @@
 {-# LANGUAGE ImportQualifiedPost #-}
+{-# LANGUAGE TemplateHaskell #-}
 
 module Beegraph where
 
-import Data.Array.ST.Safe
+import Control.Lens
+import Data.Functor.Reverse (Reverse (Reverse))
 import Data.HashMap.Strict qualified as HashMap
+import Data.IntMap.Strict qualified as IntMap
+import Data.Traversable (for)
 
-class (Traversable f, Eq (f Id), Hashable (f Id)) => Language f
+class (Traversable f, Eq (f Id), Hashable (f Id), Eq (f ()), Hashable (f ())) => Language f
 
 type Id = Int
 
@@ -17,112 +21,76 @@ type Id = Int
 
 type Unsaturated = IntMap Id
 
-data Saturated = Saturated
-  { parent :: Id,
-    rank :: Word32
+data Saturated f = Saturated
+  { _parent :: Id,
+    _rank :: Word32,
+    _sat :: f Id
   }
+
+makeLenses ''Saturated
 
 data Beegraph f = Beegraph
-  { nodes :: IntMap (Either Unsaturated Saturated),
-    share :: HashMap (f Id) Id
+  { _nodes :: IntMap (Either Unsaturated (Saturated f)),
+    _unsat :: HashMap (f ()) Id,
+    _next :: Id
   }
 
-union :: Language f => Id -> Id -> Beegraph f -> Beegraph f
-union = _
+makeLenses ''Beegraph
 
-insert :: Language f => f Id -> Beegraph f -> Beegraph f
-insert = _
+nextId :: State (Beegraph f) Id
+nextId = do
+  newNode <- use next
+  next += 1
+  pure newNode
 
-find :: Language f => Beegraph f -> Id -> Id
-find = _
+union :: Language f => Id -> Id -> State (Beegraph f) ()
+union x y = do
+  x' <- find' x
+  y' <- find' y
+  when (x /= y) $ do
+    _
 
--- find :: Language f => Beegraph f -> f Id -> f Id
--- find bee f = go (void f) (toList f)
---   where
---     go node [] = case HashMap.lookup _ (graph bee) of
+insert :: Language f => f Id -> State (Beegraph f) Id
+insert node = do
+  root <- use (unsat . at (void node))
+  root' <- maybe (nextId >>= \i -> unsat . at (void node) .= Just i >> pure i) pure root
+  node' <- traverse find' node
+  foldr _ (pure root') u node'
+  _
 
--- import Control.Monad.ST.Trans (STRef, STT, newSTRef, readSTRef, writeSTRef)
--- import Data.Equivalence.STT
--- import Data.HashMap.Strict qualified as HashMap
--- union :: Node -> Node -> Beegraph -> Beegraph
-
--- find :: Beegraph -> Node -> Node
-
-{-
-    f   a
-    f   b
-    a ~ b
-    g x y ~ f b
-    h x ~ g x z
-    y ~ z
-
-    find f a, h x should be the same.
-       find f a
-    => find f a [find a]
-    => find f a [b]
-    => find f b
-
-       find h x
-    => find h x [find x]
-    => find h x [x]
-    => find h x
-    => find g x z [find x]
-    => find g x ????
-
-    find [g x z]
-    => find [g] x z
-    => find [g x] z
-    => find [y~z/g x z, z~z/g x z]
--}
-
--- data EClass f = EClass
---   { id :: Id,
---     nodes :: Seq (f Id),
---     parents :: Seq (f Id, Id)
---   }
-
--- data EGraph s f = EGraph
---   { equiv :: Equiv s Id Id, -- Id ~ Id
---     eclass :: STRef s (IntMap (EClass f)), -- Id → EClass
---     share :: STRef s (HashMap (f Id) Id), -- f Id ~ Id
---     worklist :: STRef s (Seq Id), -- Ids to upward-merge
---     next :: STRef s Id
---   }
-
--- type EM s a = STT s Identity a
-
--- add :: Language f => f Id -> EGraph s f -> EM s Id
--- add enode graph = do
---   enode' <- canonicalize graph enode
---   share' <- readSTRef (share graph)
---   whenNothing (HashMap.lookup enode' share') $ do
---     eclassId <- readSTRef (next graph)
---     writeSTRef (next graph) (eclassId + 1)
---     traverse
---       ( \child -> do
---           eclass' <- readSTRef (eclass graph)
-
+-- use (unsat . at (void node)) >>= \case
+--   Just id -> do
+--     node' <- traverse find' node
+--     foldr
+--       ( \current prev -> do
+--           pred <- prev
+--           y <- preuse $ nodes . ix pred . _Left . ix current
+--           _
 --       )
---       enode'
---     writeSTRef (share graph) (HashMap.insert enode' eclassId share')
---     pure eclassId
+--       (pure id)
+--       node'
+--   Nothing -> do
+--     node' <- traverse find' node
+--     newNode <- nextId
+--     last <-
+--       foldr
+--         ( \current prev -> do
+--             parent <- prev
+--             newNode <- nextId
+--             nodes . at newNode .= Just (Left $ IntMap.insert current parent mempty)
+--             pure current
+--         )
+--         (pure newNode)
+--         (Reversed node')
+--     nodes . at newNode .= Just (Right $ Saturated newNode 0 node)
+--     unsat . at (void node) .= Just last
+--     pure newNode
 
--- merge :: Id -> Id -> EGraph s f -> EM s Id
--- merge a b graph = do
---   eq <- liftA2 (==) (efind graph a) (efind graph b)
---   if eq
---     then efind graph a
---     else do
---       equate (equiv graph) a b
---       newId <- efind graph a
---       wl <- readSTRef (worklist graph)
---       writeSTRef (worklist graph) (one newId <> wl)
---       pure newId
-
--- canonicalize :: Language f => EGraph s f -> f Id -> EM s (f Id)
--- canonicalize = traverse . efind
-
--- efind :: EGraph s f -> Id -> EM s Id
--- efind graph id = do
---   c <- getClass (equiv graph) id
---   desc (equiv graph) c
+find' :: Language f => Id -> State (Beegraph f) Id
+find' id = state $ \graph -> case IntMap.lookup id (_nodes graph) of
+  Nothing -> (id, graph)
+  Just (Left _us) -> (id, graph)
+  Just (Right s) -> go (void (_sat s)) (toList (_sat s))
+  where
+    go :: f () -> [Id] -> (Id, Beegraph f)
+    go _ [] = _

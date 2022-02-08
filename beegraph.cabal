@@ -1,5 +1,5 @@
 cabal-version:      2.4
-name:               pltest
+name:               beegraph
 version:            0.1.0.0
 license:            MIT
 copyright:          2021 Sofia M.A
@@ -14,14 +14,20 @@ extra-source-files:
   LICENSE
   README.md
 
-executable flaker
+executable beegraph
   build-depends:
+    , array
+    , assoc
     , base
+    , bifunctors
     , bytestring
-    , charset
+    , comonad
+    , comonad-extras
     , containers
     , data-fix
+    , equivalence
     , functor-combinators
+    , hashable
     , haskeline
     , lens
     , mtl
@@ -29,22 +35,23 @@ executable flaker
     , prettyprinter
     , profunctors
     , recursion-schemes
-    , relude
-    , shower
-    , streamly
-    -- , souffle-dsl
+    , sofialude
+    , semialign
+    , smash
     , souffle-haskell
+    , STMonadTrans
     , tagged
     , text
+    , these
     , time
     , trifecta
+    , unordered-containers
+    , validation
     , vector
-    , witherable
-
+    
   mixins:
     base hiding (Prelude),
-    relude (Relude as Prelude, Relude.Container.One),
-    relude
+    sofialude (Sofialude as Prelude)
 
   ghc-options:
     -Wall -Wincomplete-record-updates -Wincomplete-uni-patterns
@@ -106,11 +113,11 @@ executable flaker
     ViewPatterns
 
   main-is:            Main.hs
-  extra_modules:      BF.hs
+  other-modules:      Beegraph BeeEff
   cxx-options:
     -D__EMBEDDED_SOUFFLE__
     -std=c++17
   cxx-sources:
-    src/sema.cpp
+    -- src/sema.cpp
   hs-source-dirs:     src
   default-language:   Haskell2010

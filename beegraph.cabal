@@ -26,6 +26,7 @@ executable beegraph
     , containers
     , data-fix
     , equivalence
+    , free
     , functor-combinators
     , hashable
     , haskeline
@@ -36,7 +37,6 @@ executable beegraph
     , profunctors
     , recursion-schemes
     , relude
-    --, sofialude
     , semialign
     , smash
     , souffle-haskell
@@ -50,11 +50,11 @@ executable beegraph
     , unordered-containers
     , validation
     , vector
+    , witherable
     
   mixins:
     base hiding (Prelude),
     relude (Relude as Prelude)
-    -- sofialude (Sofialude as Prelude)
 
   ghc-options:
     -Wall -Wincomplete-record-updates -Wincomplete-uni-patterns
@@ -116,7 +116,7 @@ executable beegraph
     ViewPatterns
 
   main-is:            Main.hs
-  other-modules:      Beegraph BeeEff
+  other-modules:      Beegraph BeeEff Beegrapher
   cxx-options:
     -D__EMBEDDED_SOUFFLE__
     -std=c++17

@@ -25,7 +25,6 @@ executable beegraph
     , comonad-extras
     , containers
     , data-fix
-    , equivalence
     , free
     , functor-combinators
     , hashable
@@ -34,13 +33,13 @@ executable beegraph
     , mtl
     , optparse-applicative
     , prettyprinter
+    , prettyprinter-ansi-terminal
     , profunctors
     , recursion-schemes
     , relude
     , semialign
     , smash
-    , souffle-haskell
-    , STMonadTrans
+    -- souffle-haskell
     , tagged
     , text
     , these
@@ -116,7 +115,7 @@ executable beegraph
     ViewPatterns
 
   main-is:            Main.hs
-  other-modules:      Beegraph BeeEff Beegrapher
+  other-modules:      Beegraph BeeEff Match
   cxx-options:
     -D__EMBEDDED_SOUFFLE__
     -std=c++17

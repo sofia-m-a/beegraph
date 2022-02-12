@@ -1,150 +1,191 @@
 {-# LANGUAGE ImportQualifiedPost #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TemplateHaskell #-}
--- needed for some 'Show' instances...
-{-# LANGUAGE UndecidableInstances #-}
 
-module Beegraph where
+module Beegraph
+  ( Language,
+    type Id,
+    Event (..),
+    type Watcher,
+    Beegraph,
+    watcher,
+    type BG,
+    emptyBee,
+    insertBee,
+    unionBee,
+    unionBeeId,
+    type Weighted,
+    astDepth,
+    astSize,
+    extractBee,
+  )
+where
 
-import Control.Comonad (extract)
-import Control.Comonad.Cofree
+import Control.Comonad (Comonad (extract))
+import Control.Comonad.Cofree (Cofree ((:<)), ComonadCofree (unwrap))
 import Control.Lens hiding ((:<))
-import Control.Monad.Trans.Accum
+import Control.Monad.Trans.Accum (AccumT, add, runAccumT)
 import Data.Foldable (maximum)
-import Data.These (These (That, These, This))
+import Data.IntMap qualified as IntMap
+import Data.IntSet qualified as IntSet
 import Data.Traversable (for)
-import Data.Zip (Semialign (align))
-import Witherable
+import Witherable (Witherable (wither), mapMaybe)
 import Prelude hiding (mapMaybe)
 
-class (Traversable f, Eq (f ()), Hashable (f ())) => Language f
+class (Traversable f, Eq (f Id), Hashable (f Id)) => Language f
 
 type Id = Int
 
 data Node f = Node
-  { -- map from argument to a parent node that's this node applied to that argument
-    _parents :: IntMap Id,
-    -- a node equal to this (like an 'epsilon' argument parent)
-    _parent :: Id,
-    -- depth of epsilon-children of this node
-    _rank :: Int32,
-    -- how we made this node
-    _root :: f (),
-    _path :: [Id],
-    -- if this node is saturated (an output node)
-    _sat :: Maybe (f Id)
+  { -- union-find fields
+    _ufParent :: !Id,
+    _ufRank :: !Word16,
+    _shape :: !(f Id)
   }
-
-deriving instance (Show (f ()), Show (f Id)) => Show (Node f)
 
 makeLenses ''Node
 
-data Beegraph f = Beegraph
+data Event f
+  = Insert (Id, f Id)
+  | Union (Id, f Id) (Id, f Id)
+
+type Watcher f = Cofree ((->) (Event f))
+
+data Beegraph f i = Beegraph
   { -- map from id to node
-    _nodes :: IntMap (Node f),
-    -- map from root constructor to id
-    _roots :: HashMap (f ()) Id,
+    _nodes :: !(IntMap (Node f)),
+    -- map from id to set of nodes in which it occurs
+    _places :: !(IntMap IntSet),
+    -- map from node shape to id
+    _shapes :: !(HashMap (f Id) Id),
     -- the next 'Id' to use
-    _next :: Id
+    _next :: !Id,
+    -- accumulated info
+    _watcher :: Watcher f i
   }
 
 makeLenses ''Beegraph
 
-deriving instance (Show (f ()), Show (f Id)) => Show (Beegraph f)
+type BG f i a = State (Beegraph f i) a
 
-type BG f a = State (Beegraph f) a
+emptyBee :: Language f => Watcher f i -> Beegraph f i
+emptyBee = Beegraph mempty mempty mempty 0
 
-withNextId :: (Id -> BG f ()) -> BG f Id
-withNextId f = do
-  i <- use next
+-- union-find
+ufInsert :: f Id -> BG f i Id
+ufInsert node = do
+  n <- use next
   next += 1
-  f i
-  pure i
+  nodes . at n .= Just (Node n 0 node)
+  pure n
 
-withNode :: Id -> (Node f -> BG f Id) -> BG f Id
-withNode i f = do
+ufFind :: Id -> BG f i Id
+ufFind i = do
   n <- preuse (nodes . ix i)
-  maybe (pure i) f n
+  if
+      | Just (Node j' _ _) <- n,
+        i /= j' -> do
+        -- chase parent pointers, path compression
+        grandparent <- preuse (nodes . ix j' . ufParent)
+        for_ grandparent (\gp -> nodes . ix i . ufParent .= gp)
+        ufFind j'
+      | otherwise -> do
+        pure i
 
--- | merges two maps, 'unionBee'ing any common 'Id's
-merge :: Language f => IntMap Id -> IntMap Id -> BG f (IntMap Id)
-merge a b = for (align a b) $
-  \case
-    This a' -> pure a'
-    That b' -> pure b'
-    These a' b' -> do
-      a' `unionBee` b'
-      pure b'
-
--- | looks for a parent node for current, using a stack of transitions to make, and a map of
-seek :: Language f => Id -> [Id] -> IntMap Id -> BG f Id
-seek current stack drag = do
-  withNode current $ \n' -> do
-    let epsilon = _parent n'
-    let rest = _parents n'
-    -- if this node has an equivalent parent
-    if epsilon /= current
-      then do
-        -- detach the nodes we're about to drag away
-        nodes . ix current . parents .= mempty
-        -- optimize the path
-        grandparent <- preuse (nodes . ix epsilon . parent)
-        for_ grandparent (\gp -> nodes . ix current . parent .= gp)
-        -- continue dragging behind our other parents
-        seek epsilon stack =<< drag `merge` rest
-      else case stack of
-        [] -> pure current
-        (s : ss) -> do
-          s' <- findBee s
-          let c = rest ^? ix s
-          let c' = rest ^? ix s'
-          s'' <- case (c, c') of
-            (Nothing, Nothing) -> withNextId $ \g -> do
-              nodes . at g .= Just (Node mempty g 0 (_root n') (_path n' ++ [s']) Nothing)
-              nodes . ix current . parents . at s' .= Just g
-            (Just k, Nothing) -> do
-              nodes . ix current . parents . at s' .= Just k
-              pure k
-            (_, Just k') -> pure k'
-          seek s'' ss drag
-
-findBee :: Language f => Id -> BG f Id
-findBee i = do
-  withNode i $ \n -> do
-    root' <- preuse (roots . ix (n ^. root))
-    maybe (pure i) (\root'' -> seek root'' (n ^. path) mempty) root'
-
-unionBee :: Language f => Id -> Id -> BG f ()
-unionBee a' b' = do
-  a <- findBee a'
-  b <- findBee b'
+ufUnion :: Id -> Id -> BG f i (Maybe Id)
+ufUnion a' b' = do
+  a <- ufFind a'
+  b <- ufFind b'
   an' <- preuse (nodes . ix a)
   bn' <- preuse (nodes . ix b)
-  when (a /= b) $
-    whenJust (liftA2 (,) an' bn') $ \(an, bn) -> do
-      let (larger, smaller) = if an ^. rank > bn ^. rank then (a, b) else (b, a)
-      nodes . ix smaller . parent .= larger
-      when (an ^. rank == bn ^. rank) $
-        nodes . ix larger . rank += 1
+  if
+      | a /= b,
+        Just an <- an',
+        Just bn <- bn' -> do
+        let (larger, smaller) = if an ^. ufRank > bn ^. ufRank then (a, b) else (b, a)
+        nodes . ix smaller . ufParent .= larger
+        when (an ^. ufRank == bn ^. ufRank) $
+          nodes . ix larger . ufRank += 1
+        pure (Just larger)
+      | otherwise -> pure Nothing
 
-insertBee :: Language f => f Id -> BG f Id
-insertBee f = do
-  -- try to find an existing root
-  r <- preuse (roots . ix (void f))
-  -- otherwise, create a new root
-  r' <-
-    whenNothing
-      r
-      ( withNextId $ \next' -> do
-          roots . at (void f) .= Just next'
-          nodes . at next' .= Just (Node mempty next' 0 (void f) [] Nothing)
-      )
-  -- and find our way to the top
-  top <- seek r' (toList f) mempty
-  -- make sure we mark the top node as saturated
-  nodes . ix top . sat %= \s -> s <|> Just f
-  pure top
+-- congruence closure
+addTerm :: Language f => f Id -> BG f i (Id, IntSet)
+addTerm i = do
+  j <- preuse (shapes . ix i)
+  j' <- whenNothing j do
+    f <- ufInsert i
+    shapes . at i .= Just f
+    pure f
+  s <- preuse (places . ix j')
+  let s' = (j',) <$> s
+  whenNothing s' do
+    places . at j' .= Just mempty
+    watcher %= ($ Insert (j', i)) . unwrap
 
+    canonicalized <- traverse ufFind i
+
+    -- construct union of occurrences, while also setting 'i' as an occurence for each subterm
+    merges' <-
+      fold <$> for i \v -> do
+        p <- preuse (places . ix v)
+        if
+            | Just p' <- p -> do
+              places . ix v . at j' .= Just ()
+              pure p'
+            | otherwise -> pure mempty
+    merges <- flip wither (IntSet.toList merges') \place -> do
+      node <- preuse (nodes . ix place . shape)
+      place' <- traverse (traverse ufFind) node
+      pure $
+        if
+            | Just place'' <- place', place'' == canonicalized -> Just (place'', canonicalized)
+            | otherwise -> Nothing
+
+    for_ merges (uncurry unionBee)
+    pure (j', mempty)
+
+canonicalize :: Language f => Id -> BG f i Id
+canonicalize i = do
+  s <- preuse (nodes . ix i . shape)
+  if
+      | Just s' <- s -> do
+        f <- traverse ufFind s'
+        fst <$> addTerm f
+      | otherwise -> pure i
+
+insertBee :: Language f => f Id -> BG f i Id
+insertBee = fmap fst . addTerm
+
+unionBeeId :: Language f => Id -> Id -> BG f i ()
+unionBeeId a b = do
+  c <- preuse (nodes . ix a . shape)
+  d <- preuse (nodes . ix b . shape)
+  fromMaybe (pure ()) $ unionBee <$> c <*> d
+
+unionBee :: Language f => f Id -> f Id -> BG f i ()
+unionBee a' b' = do
+  (a, ai) <- addTerm a'
+  (b, bi) <- addTerm b'
+  u <- ufUnion a b
+  whenJust u \u' -> do
+    watcher %= ($ Union (a, a') (b, b')) . unwrap
+    -- u is the newly-unioned class, if we had to union them
+    places . at a .= Nothing
+    places . at b .= Nothing
+    places . at u' .= Just (ai <> bi)
+    la <-
+      fromList <$> for (IntSet.toList ai) \i -> do
+        i' <- canonicalize i
+        pure (i', i)
+    lb <-
+      fromList <$> for (IntSet.toList ai) \i -> do
+        i' <- canonicalize i
+        pure (i', i)
+    let m = IntMap.intersectionWith (,) la lb
+    for_ m (uncurry unionBeeId)
+
+-- Extraction
 type Weighted f a = Cofree f a
 
 astDepth :: Foldable f => f Natural -> Natural
@@ -168,16 +209,12 @@ fixpoint f x = do
     then fixpoint f out
     else pure out
 
-extractBee :: forall f a. (Language f, Ord a) => (f a -> a) -> BG f (IntMap (Weighted f a))
+extractBee :: forall f a i. (Language f, Ord a) => (f a -> a) -> BG f i (IntMap (Weighted f a))
 extractBee weigh = do
-  -- normalize all nodes
-  get >>= (nodes . traversed . sat . _Just . traversed $ findBee)
+  get >>= (nodes . traversed . shape . traversed $ canonicalize)
   graph <- get
-  -- extract saturated nodes
-  let tops = mapMaybe (\n' -> (\sat' -> Extractor sat' (_parent n') Nothing) <$> _sat n') (graph ^. nodes)
-  -- find the fixpoint
-  let f = executingState tops $ fixpoint (const propagate) ()
-  -- extract minimum trees
+  let graph' = fmap (\n -> Extractor (n ^. shape) (n ^. ufParent) Nothing) (graph ^. nodes)
+  let f = executingState graph' (fixpoint (const propagate) ())
   pure (mapMaybe _minTree f)
   where
     update :: Cofree f a -> Extractor f a -> Id -> AccumT Any (State (IntMap (Extractor f a))) ()
@@ -189,29 +226,26 @@ extractBee weigh = do
     propagate :: AccumT Any (State (IntMap (Extractor f a))) ()
     propagate = do
       map' <- lift get
-      ifor_
-        map'
-        ( \index' node -> do
-            let nep = node ^. exParent
-            -- propagate from below
-            newWeighted <- sequenceA <$> for (node ^. exSat) (\i -> lift (preuse (ix i . minTree . _Just)))
-            whenJust
-              newWeighted
-              ( \f -> do
-                  let weighed = weigh (fmap extract f) :< f
-                  update weighed node index'
-              )
-            -- propagate from above
-            if
-                | index' /= nep,
-                  Just p <- map' ^? (ix nep . minTree . _Just) -> do
-                  update p node index'
-                | otherwise -> pure ()
-            -- propagate upwards
-            if
-                | index' /= nep,
-                  Just tree <- node ^. minTree,
-                  Just p <- map' ^? ix nep ->
-                  update tree p nep
-                | otherwise -> pure ()
-        )
+      ifor_ map' \index' node -> do
+        let nep = node ^. exParent
+        -- propagate from below
+        newWeighted <- sequenceA <$> for (node ^. exSat) (\i -> lift (preuse (ix i . minTree . _Just)))
+        whenJust
+          newWeighted
+          ( \f -> do
+              let weighed = weigh (fmap extract f) :< f
+              update weighed node index'
+          )
+        -- propagate from above
+        if
+            | index' /= nep,
+              Just p <- map' ^? (ix nep . minTree . _Just) -> do
+              update p node index'
+            | otherwise -> pure ()
+        -- propagate upwards
+        if
+            | index' /= nep,
+              Just tree <- node ^. minTree,
+              Just p <- map' ^? ix nep ->
+              update tree p nep
+            | otherwise -> pure ()

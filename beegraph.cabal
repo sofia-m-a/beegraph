@@ -39,7 +39,8 @@ executable beegraph
     , relude
     , semialign
     , smash
-    -- souffle-haskell
+    -- , sofialude
+    -- , souffle-haskell
     , tagged
     , text
     , these

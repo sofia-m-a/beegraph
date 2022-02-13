@@ -8,8 +8,9 @@
       flake = false;
     };
     souffle-haskell.url = "github:luc-tielen/souffle-haskell";
+    sofialude.url = "github:sofia-m-a/sofialude";
   };
-  outputs = inputs@{ self, nixpkgs, flake-utils, souffle-haskell, ... }:
+  outputs = inputs@{ self, nixpkgs, flake-utils, souffle-haskell, sofialude, ... }:
     flake-utils.lib.eachSystem [ "x86_64-linux" "x86_64-darwin" "aarch64-darwin" ] (system:
       let
         overlays = [ ]
@@ -48,7 +49,9 @@
             name = "beegraph";
             root = ./.;
             withHoogle = false;
-            overrides = self: super: with pkgs.haskell.lib; { };
+            overrides = self: super: with pkgs.haskell.lib; {
+              sofialude = self.callPackage sofialude { };
+            };
             modifier = drv:
               pkgs.haskell.lib.addBuildTools drv
                 (with (if system == "aarch64-darwin"

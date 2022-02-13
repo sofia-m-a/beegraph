@@ -1,15 +1,13 @@
 module BeeEff where
 
-import Beegraph (BG, Id, Language, Weighted, emptyBee, insertBee, unionBee, unionBeeId)
-import Control.Comonad.Cofree (Cofree, ComonadCofree (unwrap), coiter)
+import Beegraph (BG, Id, Language, emptyBee, insertBee, unionBeeId)
+import Control.Comonad.Cofree (Cofree, coiter)
 import Control.Comonad.Trans.Cofree (CofreeF ((:<)))
 import Control.Lens hiding ((:<))
-import Data.Fix (Fix, foldFix, unfoldFix)
 import Data.Functor.Foldable (cata)
 import qualified Data.IntMap as IntMap
 import Match
 import Prettyprinter
-import Prettyprinter.Render.Terminal
 
 data Instruction
   = Add Int
@@ -30,14 +28,23 @@ single = \case
   _ -> Nothing
 
 parse :: String -> Maybe [Instruction]
-parse s = reverse <$> go [] [] s
+parse = go [] []
   where
+    --    instructions     blocks to process  input
+    go :: [Instruction] -> [[Instruction]] -> String -> Maybe [Instruction]
+    -- nothing left to process
     go is [] "" = Just is
-    go _ _ "" = Nothing -- unmatched left bracket
+    -- unmatched left bracket
+    go _ (_ : _) "" = Nothing
+    -- process single instruction
     go is ks (s' : ss) | Just i <- single s' = go (i : is) ks ss
+    -- begin block
     go is ks ('[' : ss) = go [] (is : ks) ss
+    -- end block
     go is (js : ks) (']' : ss) = go (Loop is : js) ks ss
-    go _ [] (']' : _) = Nothing -- unmatched right bracket
+    -- unmatched right bracket
+    go _ [] (']' : _) = Nothing
+    -- comment
     go is ks (_ : ss) = go is ks ss
 
 rle :: [Instruction] -> [Instruction]
@@ -146,10 +153,7 @@ build is = do
           headTape <- insertBee $ PySelect loopTape head'
           pure (headIO, headMem, headTape, fake')
 
-data BeeEffAnalysis = BFA
-  { integers :: IntMap Int
-  }
-
+-- simple attempt at giving costs to pyro instructions
 weighPyro :: Pyro Word -> Word
 weighPyro = \case
   PyAdd wo wo' -> 1 + wo + wo'
@@ -190,10 +194,15 @@ analyze =
 
 prettyPyro :: Cofree Pyro Word -> Doc ann
 prettyPyro = snd . prettyPyro'
-
-prettyPyro' :: Cofree Pyro Word -> (Word, Doc ann)
-prettyPyro' = cata \(name :< body) ->
-  ( name,
-    vsep (toList $ fmap snd body) <> line
-      <> pretty name <+> "←" <+> pretty (fmap fst body)
-  )
+  where
+    prettyPyro' :: Cofree Pyro Word -> (Word, Doc ann)
+    prettyPyro' = cata \(name :< body) ->
+      ( name,
+        vsep (toList $ fmap snd body)
+          <> ( if null (toList body)
+                 then mempty
+                 else line
+             )
+          <> pretty name <+> "←" <+> pretty (fmap fst body)
+          -- <> line
+      )

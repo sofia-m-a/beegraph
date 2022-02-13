@@ -18,21 +18,26 @@ module Beegraph
     astDepth,
     astSize,
     extractBee,
+    queryByShape,
   )
 where
 
 import Control.Comonad (Comonad (extract))
 import Control.Comonad.Cofree (Cofree ((:<)), ComonadCofree (unwrap))
 import Control.Lens hiding ((:<))
+import Control.Monad.ST (ST, runST)
 import Control.Monad.Trans.Accum (AccumT, add, runAccumT)
+import Data.Array.ST.Safe (MArray (getBounds), STArray, newListArray, readArray)
 import Data.Foldable (maximum)
 import Data.IntMap qualified as IntMap
 import Data.IntSet qualified as IntSet
+import Data.Map qualified as Map
+import Data.STRef (STRef, newSTRef, readSTRef)
 import Data.Traversable (for)
 import Witherable (Witherable (wither), mapMaybe)
 import Prelude hiding (mapMaybe)
 
-class (Traversable f, Eq (f Id), Hashable (f Id)) => Language f
+class (Traversable f, Ord (f Id)) => Language f
 
 type Id = Int
 
@@ -57,7 +62,7 @@ data Beegraph f i = Beegraph
     -- map from id to set of nodes in which it occurs
     _places :: !(IntMap IntSet),
     -- map from node shape to id
-    _shapes :: !(HashMap (f Id) Id),
+    _shapes :: !(Map (f Id) Id),
     -- the next 'Id' to use
     _next :: !Id,
     -- accumulated info
@@ -249,3 +254,47 @@ extractBee weigh = do
               Just p <- map' ^? ix nep ->
               update tree p nep
             | otherwise -> pure ()
+
+data Foo a
+  = F a a
+  | G Int
+  deriving (Eq, Ord, Generic, Functor, Foldable, Traversable)
+
+instance Hashable a => Hashable (Foo a)
+
+submapBetween :: Ord k => (k, k) -> Map k a -> Map k a
+submapBetween (l, h) m = eq
+  where
+    (_less, greaterEq) = Map.split l m
+    (eq, _greater) = Map.split h greaterEq
+
+queryByShape :: Language f => f () -> BG f i (Map (f Id) Id)
+queryByShape shape' =
+  submapBetween (shape' $> minBound, shape' $> maxBound) <$> use shapes
+
+data Leaper k a = Leaper a (k -> a)
+  deriving (Functor)
+
+type Joiner k = Cofree (Leaper k) (Maybe k)
+
+leapfrog :: forall k. Ord k => [Joiner k] -> Joiner k
+leapfrog js = runST go
+  where
+    go :: forall s. ST s (Joiner k)
+    go = do
+      arr :: STArray s Int (Joiner k) <- newListArray (0, length js) (sortOn extract js)
+      p :: STRef s Int <- newSTRef 0
+      _
+
+    search :: forall s. STArray s Int (Joiner k) -> STRef s Int -> ST s (Maybe k)
+    search arr p = do
+      len <- snd <$> getBounds arr
+      p' <- readSTRef p
+      maxK <- readArray arr ((p' - 1) `mod` len)
+      _
+
+{-
+  key :: S -> k
+  next : S -> Maybe S
+  seek : k -> S -> S
+-}

@@ -20,26 +20,26 @@ module Beegraph
 where
 
 import Control.Comonad (Comonad (extract))
-import Control.Comonad.Cofree (Cofree ((:<)), ComonadCofree (unwrap), coiter, _extract, _unwrap)
-import Control.Comonad.Cofree qualified as Cofree
+import Control.Comonad.Cofree (Cofree ((:<)), coiter, _extract, _unwrap)
 import Control.Lens hiding ((:<))
-import Control.Monad.Free
 import Control.Monad.Trans.Accum (AccumT, add, runAccumT)
-import Data.Fix (Fix (Fix))
 import Data.Foldable (maximum)
-import Data.Functor.Combinator (Comp)
 import Data.IntMap qualified as IntMap
 import Data.IntSet qualified as IntSet
 import Data.Map qualified as Map
 import Data.Sequence (Seq ((:<|), (:|>)))
-import Data.Sequence qualified as Seq
 import Data.Traversable (for)
 import Witherable (Witherable (wither), mapMaybe)
 import Prelude hiding (mapMaybe)
 
 class (Traversable f, Ord (f Id)) => Language f
 
-type Id = Int
+newtype Id = Id {_unId :: Int}
+  deriving (Eq, Ord, Show, Generic)
+
+instance Hashable Id
+
+makeLenses ''Id
 
 data Node f = Node
   { -- union-find fields
@@ -49,8 +49,6 @@ data Node f = Node
   }
 
 makeLenses ''Node
-
-type Watcher f = Free (Comp Maybe ((->) (f Id)))
 
 data Beegraph f i = Beegraph
   { -- map from id to node
@@ -68,25 +66,25 @@ makeLenses ''Beegraph
 type BG f i a = State (Beegraph f i) a
 
 emptyBee :: Language f => Beegraph f i
-emptyBee = Beegraph mempty mempty mempty 0
+emptyBee = Beegraph mempty mempty mempty (Id 0)
 
 -- union-find
 ufInsert :: f Id -> BG f i Id
 ufInsert node = do
   n <- use next
-  next += 1
-  nodes . at n .= Just (Node n 0 node)
+  next . unId += 1
+  nodes . at (_unId n) .= Just (Node n 0 node)
   pure n
 
 ufFind :: Id -> BG f i Id
 ufFind i = do
-  n <- preuse (nodes . ix i)
+  n <- preuse (nodes . ix (_unId i))
   if
       | Just (Node j' _ _) <- n,
         i /= j' -> do
         -- chase parent pointers, path compression
-        grandparent <- preuse (nodes . ix j' . ufParent)
-        for_ grandparent (\gp -> nodes . ix i . ufParent .= gp)
+        grandparent <- preuse (nodes . ix (_unId j') . ufParent)
+        for_ grandparent (\gp -> nodes . ix (_unId i) . ufParent .= gp)
         ufFind j'
       | otherwise -> do
         pure i
@@ -95,16 +93,16 @@ ufUnion :: Id -> Id -> BG f i (Maybe Id)
 ufUnion a' b' = do
   a <- ufFind a'
   b <- ufFind b'
-  an' <- preuse (nodes . ix a)
-  bn' <- preuse (nodes . ix b)
+  an' <- preuse (nodes . ix (_unId a))
+  bn' <- preuse (nodes . ix (_unId b))
   if
       | a /= b,
         Just an <- an',
         Just bn <- bn' -> do
         let (larger, smaller) = if an ^. ufRank > bn ^. ufRank then (a, b) else (b, a)
-        nodes . ix smaller . ufParent .= larger
+        nodes . ix (_unId smaller) . ufParent .= larger
         when (an ^. ufRank == bn ^. ufRank) $
-          nodes . ix larger . ufRank += 1
+          nodes . ix (_unId larger) . ufRank += 1
         pure (Just larger)
       | otherwise -> pure Nothing
 
@@ -116,10 +114,10 @@ addTerm i = do
     f <- ufInsert i
     shapes . at i .= Just f
     pure f
-  s <- preuse (places . ix j')
+  s <- preuse (places . ix (_unId j'))
   let s' = (j',) <$> s
   whenNothing s' do
-    places . at j' .= Just mempty
+    places . at (_unId j') .= Just mempty
     --watcher %= ($ Insert (j', i)) . unwrap
 
     canonicalized <- traverse ufFind i
@@ -127,10 +125,10 @@ addTerm i = do
     -- construct union of occurrences, while also setting 'i' as an occurence for each subterm
     merges' <-
       fold <$> for i \v -> do
-        p <- preuse (places . ix v)
+        p <- preuse (places . ix (_unId v))
         if
             | Just p' <- p -> do
-              places . ix v . at j' .= Just ()
+              places . ix (_unId v) . at (_unId j') .= Just ()
               pure p'
             | otherwise -> pure mempty
     merges <- flip wither (IntSet.toList merges') \place -> do
@@ -146,7 +144,7 @@ addTerm i = do
 
 canonicalize :: Language f => Id -> BG f i Id
 canonicalize i = do
-  s <- preuse (nodes . ix i . shape)
+  s <- preuse (nodes . ix (_unId i) . shape)
   if
       | Just s' <- s -> do
         f <- traverse ufFind s'
@@ -158,8 +156,8 @@ insertBee = fmap fst . addTerm
 
 unionBeeId :: Language f => Id -> Id -> BG f i ()
 unionBeeId a b = do
-  c <- preuse (nodes . ix a . shape)
-  d <- preuse (nodes . ix b . shape)
+  c <- preuse (nodes . ix (_unId a) . shape)
+  d <- preuse (nodes . ix (_unId b) . shape)
   fromMaybe (pure ()) $ unionBee <$> c <*> d
 
 unionBee :: Language f => f Id -> f Id -> BG f i ()
@@ -170,17 +168,17 @@ unionBee a' b' = do
   whenJust u \u' -> do
     --watcher %= ($ Union (a, a') (b, b')) . unwrap
     -- u is the newly-unioned class, if we had to union them
-    places . at a .= Nothing
-    places . at b .= Nothing
-    places . at u' .= Just (ai <> bi)
+    places . at (_unId a) .= Nothing
+    places . at (_unId b) .= Nothing
+    places . at (_unId u') .= Just (ai <> bi)
     la <-
       fromList <$> for (IntSet.toList ai) \i -> do
-        i' <- canonicalize i
-        pure (i', i)
+        i' <- canonicalize (Id i)
+        pure (_unId i', Id i)
     lb <-
       fromList <$> for (IntSet.toList ai) \i -> do
-        i' <- canonicalize i
-        pure (i', i)
+        i' <- canonicalize (Id i)
+        pure (_unId i', Id i)
     let m = IntMap.intersectionWith (,) la lb
     for_ m (uncurry unionBeeId)
 
@@ -219,35 +217,37 @@ extractBee weigh = do
     update :: Cofree f a -> Extractor f a -> Id -> AccumT Any (State (IntMap (Extractor f a))) ()
     update tree node index' = when (((\tree' -> extract tree < extract tree') <$> node ^. minTree) /= Just False) $
       do
-        lift (ix index' . minTree .= Just tree)
+        lift (ix (_unId index') . minTree .= Just tree)
         add (Any True)
 
     propagate :: AccumT Any (State (IntMap (Extractor f a))) ()
     propagate = do
       map' <- lift get
-      ifor_ map' \index' node -> do
-        let nep = node ^. exParent
-        -- propagate from below
-        newWeighted <- sequenceA <$> for (node ^. exSat) (\i -> lift (preuse (ix i . minTree . _Just)))
-        whenJust
-          newWeighted
-          ( \f -> do
-              let weighed = weigh (fmap extract f) :< f
-              update weighed node index'
-          )
-        -- propagate from above
-        if
-            | index' /= nep,
-              Just p <- map' ^? (ix nep . minTree . _Just) -> do
-              update p node index'
-            | otherwise -> pure ()
-        -- propagate upwards
-        if
-            | index' /= nep,
-              Just tree <- node ^. minTree,
-              Just p <- map' ^? ix nep ->
-              update tree p nep
-            | otherwise -> pure ()
+      ifor_ map' \index'' node ->
+        let index' = Id index''
+         in do
+              let nep = node ^. exParent
+              -- propagate from below
+              newWeighted <- sequenceA <$> for (node ^. exSat) (\i -> lift (preuse (ix (_unId i) . minTree . _Just)))
+              whenJust
+                newWeighted
+                ( \f -> do
+                    let weighed = weigh (fmap extract f) :< f
+                    update weighed node index'
+                )
+              -- propagate from above
+              if
+                  | index' /= nep,
+                    Just p <- map' ^? (ix (_unId nep) . minTree . _Just) -> do
+                    update p node index'
+                  | otherwise -> pure ()
+              -- propagate upwards
+              if
+                  | index' /= nep,
+                    Just tree <- node ^. minTree,
+                    Just p <- map' ^? ix (_unId nep) ->
+                    update tree p nep
+                  | otherwise -> pure ()
 
 submapBetween :: Ord k => (k, k) -> Map k a -> Map k a
 submapBetween (l, h) m = eq
@@ -257,7 +257,7 @@ submapBetween (l, h) m = eq
 
 queryByShape :: Language f => f () -> BG f i (Map (f Id) Id)
 queryByShape shape' =
-  submapBetween (shape' $> minBound, shape' $> maxBound) <$> use shapes
+  submapBetween (shape' $> Id minBound, shape' $> Id maxBound) <$> use shapes
 
 data LeapVal
   = Some Id
@@ -300,39 +300,6 @@ triejoin ls = case fromList $ sortOn extract ls of
                   let s = (r ^. mini . _unwrap) seek in go (rotateRingL $ r & mini .~ s)
               | otherwise ->
                 let s = (r ^. mini . _unwrap) (Just hi) in go (rotateRingL $ r & mini .~ s)
-
-nats :: Int -> Int -> Leaper LeapVal
-nats step offset =
-  coiter
-    ( \s -> \case
-        Nothing -> case s of
-          Some n -> Some $ n + step
-          End -> End
-        Just k -> case s of
-          Some s' -> Some $ ((s' - offset) `div` step) * step + offset
-          End -> End
-    )
-    (Some offset)
-
-listy :: [Int] -> Leaper LeapVal
-listy = Cofree.unfold \case
-  [] -> (End, const [])
-  s : ss ->
-    ( Some s,
-      \case
-        Nothing -> ss
-        Just (Some k) -> dropWhile (< k) ss
-        Just End -> []
-    )
-
-show10 :: Leaper LeapVal -> [LeapVal]
-show10 l = map extract $ take 10 $ iterate f l
-  where
-    f :: Leaper LeapVal -> Leaper LeapVal
-    f s = unwrap s Nothing
-
-test :: [LeapVal]
-test = show10 $ triejoin [listy [0 .. 20], listy [2, 4, 6, 8, 10, 12], listy [3, 6, 9, 12, 15]]
 
 data Foo a
   = F a a

@@ -5,6 +5,7 @@ module Main where
 -- todo: extractBee doesn't show sharing
 -- todo: pattern matching
 -- todo: associative-commutative
+-- todo: make Id a newtype
 
 import BeeEff
 import Beegraph

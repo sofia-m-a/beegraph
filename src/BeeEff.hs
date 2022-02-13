@@ -175,22 +175,22 @@ weighPyro = \case
   PySelect wo wo' -> 1 + wo + wo'
   PyFake _wo -> 0
 
-analyze :: String -> Maybe (Cofree Pyro Word)
-analyze =
-  parse
-    >=> rle
-    >>> build
-    >>> usingState (emptyBee (coiter const Nothing))
-    >>> second (run weighPyro)
-    >>> uncurry IntMap.lookup
-    >=> evaluatingState (0 :: Word)
-      . traverse
-        ( \_weight -> do
-            s <- get
-            put (s + 1)
-            pure s
-        )
-    >>> pure
+-- analyze :: String -> Maybe (Cofree Pyro Word)
+-- analyze =
+--   parse
+--     >=> rle
+--     >>> build
+--     >>> usingState emptyBee
+--     >>> second (run weighPyro)
+--     >>> uncurry IntMap.lookup
+--     >=> evaluatingState (0 :: Word)
+--       . traverse
+--         ( \_weight -> do
+--             s <- get
+--             put (s + 1)
+--             pure s
+--         )
+--     >>> pure
 
 prettyPyro :: Cofree Pyro Word -> Doc ann
 prettyPyro = snd . prettyPyro'

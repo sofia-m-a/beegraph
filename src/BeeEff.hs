@@ -1,6 +1,6 @@
 module BeeEff where
 
-import Beegraph (BG, Id, Language, emptyBee, insertBee, unionBeeId)
+import Beegraph (BG, Id, Language, emptyBee, insertBee, unionBee)
 import Control.Comonad.Cofree (Cofree, coiter)
 import Control.Comonad.Trans.Cofree (CofreeF ((:<)))
 import Control.Lens hiding ((:<))
@@ -101,14 +101,14 @@ instance (Show a, Pretty a) => Pretty (Pyro a) where
     PyFake _wo -> "FAKE"
 
 -- utterly disgusting
-build :: [Instruction] -> BG Pyro i Id
+build :: [Instruction] -> BG Pyro Id
 build is = do
   io <- insertBee PyStartIO
   mem <- insertBee PyZeroArray
   tape <- insertBee $ PyInt 0
   view _1 <$> foldr go (pure (io, mem, tape, 0)) is
   where
-    go :: Instruction -> BG Pyro i (Id, Id, Id, Word) -> BG Pyro i (Id, Id, Id, Word)
+    go :: Instruction -> BG Pyro (Id, Id, Id, Word) -> BG Pyro (Id, Id, Id, Word)
     go i imt = do
       (io, mem, tape, fake) <- imt
       case i of
@@ -139,11 +139,11 @@ build is = do
           loopTapef <- insertBee $ PyFake $ fake + 2
           (lbi, lbm, lbt, fake') <- foldr go (pure (io, mem, tape, fake + 3)) ins
           loopIO <- insertBee $ PyStream io lbi
-          unionBeeId loopIO loopIOf
+          unionBee loopIO loopIOf
           loopMem <- insertBee $ PyStream mem lbm
-          unionBeeId loopMem loopMemf
+          unionBee loopMem loopMemf
           loopTape <- insertBee $ PyStream tape lbt
-          unionBeeId loopTape loopTapef
+          unionBee loopTape loopTapef
           v0 <- insertBee $ PyInt 0
           vl <- insertBee $ PyLoad loopMem loopTape
           cond <- insertBee $ PyEq v0 vl

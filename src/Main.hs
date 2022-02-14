@@ -2,10 +2,8 @@ module Main where
 
 -- todo: clean up BeeEff
 -- todo: separate rebuilding step
--- todo: extractBee doesn't show sharing
 -- todo: pattern matching
 -- todo: associative-commutative
--- todo: make Id a newtype
 
 import BeeEff
 import Beegraph

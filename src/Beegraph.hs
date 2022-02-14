@@ -15,12 +15,12 @@ module Beegraph
     astDepth,
     astSize,
     extractBee,
-    queryByShape,
   )
 where
 
 import Control.Comonad (Comonad (extract))
 import Control.Comonad.Cofree (Cofree ((:<)), coiter, _extract, _unwrap)
+import Control.Comonad.Cofree qualified as Cofree
 import Control.Lens hiding ((:<))
 import Control.Monad.Trans.Accum (AccumT, add, runAccumT)
 import Data.Foldable (maximum)
@@ -32,7 +32,7 @@ import Data.Traversable (for)
 import Witherable (Witherable (wither), mapMaybe)
 import Prelude hiding (mapMaybe)
 
-class (Traversable f, Ord (f Id)) => Language f
+class (Traversable f, Ord (f Id), Hashable (f Id)) => Language f
 
 newtype Id = Id {_unId :: Int}
   deriving (Eq, Ord, Show, Generic)
@@ -44,43 +44,45 @@ makeLenses ''Id
 data Node f = Node
   { -- union-find fields
     _ufParent :: !Id,
-    _ufRank :: !Word16,
-    _shape :: !(f Id)
+    _ufRank :: !Word16
   }
 
 makeLenses ''Node
 
-data Beegraph f i = Beegraph
-  { -- map from id to node
+data Beeclass f = Beeclass
+  { _shapes :: !(Set (f Id)),
+    _parents :: !(Set (f Id, Id))
+  }
+
+makeLenses ''Beeclass
+
+data Beegraph f = Beegraph
+  { -- union find: equivalence relation over beeclass-IDs
     _nodes :: !(IntMap (Node f)),
-    -- map from id to set of nodes in which it occurs
-    _places :: !(IntMap IntSet),
-    -- map from node shape to id
-    _shapes :: !(Map (f Id) Id),
-    -- the next 'Id' to use
-    _next :: !Id
+    -- maps beeclass-IDS to beeclasses
+    _classes :: !(IntMap (Beeclass f)),
+    _share :: !(HashMap (f Id) Id)
   }
 
 makeLenses ''Beegraph
 
-type BG f i a = State (Beegraph f i) a
+type BG f a = State (Beegraph f) a
 
-emptyBee :: Language f => Beegraph f i
-emptyBee = Beegraph mempty mempty mempty (Id 0)
+emptyBee :: Language f => Beegraph f
+emptyBee = Beegraph mempty mempty mempty
 
 -- union-find
-ufInsert :: f Id -> BG f i Id
-ufInsert node = do
-  n <- use next
-  next . unId += 1
-  nodes . at (_unId n) .= Just (Node n 0 node)
-  pure n
+ufInsert :: BG f Id
+ufInsert = do
+  n <- fst . maybe 0 (+ 1) . IntMap.lookupMax <$> use nodes
+  nodes . at n .= Just (Node (Id n) 0)
+  pure (Id n)
 
-ufFind :: Id -> BG f i Id
+ufFind :: Id -> BG f Id
 ufFind i = do
   n <- preuse (nodes . ix (_unId i))
   if
-      | Just (Node j' _ _) <- n,
+      | Just (Node j' _) <- n,
         i /= j' -> do
         -- chase parent pointers, path compression
         grandparent <- preuse (nodes . ix (_unId j') . ufParent)
@@ -89,7 +91,7 @@ ufFind i = do
       | otherwise -> do
         pure i
 
-ufUnion :: Id -> Id -> BG f i (Maybe Id)
+ufUnion :: Id -> Id -> BG f (Maybe Id)
 ufUnion a' b' = do
   a <- ufFind a'
   b <- ufFind b'
@@ -107,80 +109,84 @@ ufUnion a' b' = do
       | otherwise -> pure Nothing
 
 -- congruence closure
-addTerm :: Language f => f Id -> BG f i (Id, IntSet)
-addTerm i = do
-  j <- preuse (shapes . ix i)
-  j' <- whenNothing j do
-    f <- ufInsert i
-    shapes . at i .= Just f
-    pure f
-  s <- preuse (places . ix (_unId j'))
-  let s' = (j',) <$> s
-  whenNothing s' do
-    places . at (_unId j') .= Just mempty
-    --watcher %= ($ Insert (j', i)) . unwrap
+canonicalize :: Language f => f Id -> BG f (f Id)
+canonicalize = traverse ufFind
 
-    canonicalized <- traverse ufFind i
+insertBee :: Language f => f Id -> BG f Id
+insertBee f = do
+  g <- canonicalize f
+  m <- use (share . at g)
+  whenNothing m do
+    i <- ufInsert
+    for_ g \j -> classes . ix (_unId j) . parents . at (g, i) .= Just ()
+    share . at g .= Just i
+    pure i
 
-    -- construct union of occurrences, while also setting 'i' as an occurence for each subterm
-    merges' <-
-      fold <$> for i \v -> do
-        p <- preuse (places . ix (_unId v))
-        if
-            | Just p' <- p -> do
-              places . ix (_unId v) . at (_unId j') .= Just ()
-              pure p'
-            | otherwise -> pure mempty
-    merges <- flip wither (IntSet.toList merges') \place -> do
-      node <- preuse (nodes . ix place . shape)
-      place' <- traverse (traverse ufFind) node
-      pure $
-        if
-            | Just place'' <- place', place'' == canonicalized -> Just (place'', canonicalized)
-            | otherwise -> Nothing
+-- addTerm :: Language f => f Id -> BG f (Id, IntSet)
+-- addTerm i = do
+--   j <- preuse (shapes . ix i)
+--   j' <- whenNothing j do
+--     f <- ufInsert i
+--     shapes . at i .= Just f
+--     pure f
+--   s <- preuse (places . ix (_unId j'))
+--   let s' = (j',) <$> s
+--   whenNothing s' do
+--     places . at (_unId j') .= Just mempty
+--     --watcher %= ($ Insert (j', i)) . unwrap
 
-    for_ merges (uncurry unionBee)
-    pure (j', mempty)
+--     canonicalized <- traverse ufFind i
 
-canonicalize :: Language f => Id -> BG f i Id
-canonicalize i = do
-  s <- preuse (nodes . ix (_unId i) . shape)
-  if
-      | Just s' <- s -> do
-        f <- traverse ufFind s'
-        fst <$> addTerm f
-      | otherwise -> pure i
+--     -- construct union of occurrences, while also setting 'i' as an occurence for each subterm
+--     merges' <-
+--       fold <$> for i \v -> do
+--         p <- preuse (places . ix (_unId v))
+--         if
+--             | Just p' <- p -> do
+--               places . ix (_unId v) . at (_unId j') .= Just ()
+--               pure p'
+--             | otherwise -> pure mempty
+--     merges <- flip wither (IntSet.toList merges') \place -> do
+--       node <- preuse (nodes . ix place . shape)
+--       place' <- traverse (traverse ufFind) node
+--       pure $
+--         if
+--             | Just place'' <- place', place'' == canonicalized -> Just (place'', canonicalized)
+--             | otherwise -> Nothing
 
-insertBee :: Language f => f Id -> BG f i Id
-insertBee = fmap fst . addTerm
+--     for_ merges (uncurry unionBee)
+--     pure (j', mempty)
 
-unionBeeId :: Language f => Id -> Id -> BG f i ()
-unionBeeId a b = do
-  c <- preuse (nodes . ix (_unId a) . shape)
-  d <- preuse (nodes . ix (_unId b) . shape)
-  fromMaybe (pure ()) $ unionBee <$> c <*> d
+-- insertBee :: Language f => f Id -> BG f Id
+-- insertBee = fmap fst . addTerm
 
-unionBee :: Language f => f Id -> f Id -> BG f i ()
-unionBee a' b' = do
-  (a, ai) <- addTerm a'
-  (b, bi) <- addTerm b'
-  u <- ufUnion a b
-  whenJust u \u' -> do
-    --watcher %= ($ Union (a, a') (b, b')) . unwrap
-    -- u is the newly-unioned class, if we had to union them
-    places . at (_unId a) .= Nothing
-    places . at (_unId b) .= Nothing
-    places . at (_unId u') .= Just (ai <> bi)
-    la <-
-      fromList <$> for (IntSet.toList ai) \i -> do
-        i' <- canonicalize (Id i)
-        pure (_unId i', Id i)
-    lb <-
-      fromList <$> for (IntSet.toList ai) \i -> do
-        i' <- canonicalize (Id i)
-        pure (_unId i', Id i)
-    let m = IntMap.intersectionWith (,) la lb
-    for_ m (uncurry unionBeeId)
+-- unionBeeId :: Language f => Id -> Id -> BG f ()
+-- unionBeeId a b = do
+--   c <- preuse (nodes . ix (_unId a) . shape)
+--   d <- preuse (nodes . ix (_unId b) . shape)
+--   fromMaybe (pure ()) $ unionBee <$> c <*> d
+
+-- unionBee :: Language f => f Id -> f Id -> BG f ()
+-- unionBee a' b' = do
+--   (a, ai) <- addTerm a'
+--   (b, bi) <- addTerm b'
+--   u <- ufUnion a b
+--   whenJust u \u' -> do
+--     --watcher %= ($ Union (a, a') (b, b')) . unwrap
+--     -- u is the newly-unioned class, if we had to union them
+--     places . at (_unId a) .= Nothing
+--     places . at (_unId b) .= Nothing
+--     places . at (_unId u') .= Just (ai <> bi)
+--     la <-
+--       fromList <$> for (IntSet.toList ai) \i -> do
+--         i' <- canonicalize (Id i)
+--         pure (_unId i', Id i)
+--     lb <-
+--       fromList <$> for (IntSet.toList ai) \i -> do
+--         i' <- canonicalize (Id i)
+--         pure (_unId i', Id i)
+--     let m = IntMap.intersectionWith (,) la lb
+--     for_ m (uncurry unionBeeId)
 
 -- Extraction
 type Weighted f a = Cofree f a
@@ -194,7 +200,7 @@ astSize f = sum f + 1
 data Extractor f a = Extractor
   { _exSat :: f Id,
     _exParent :: Id,
-    _minTree :: Maybe (Weighted f a)
+    _minTree :: Maybe (Weighted f (a, Id))
   }
 
 makeLenses ''Extractor
@@ -206,7 +212,7 @@ fixpoint f x = do
     then fixpoint f out
     else pure out
 
-extractBee :: forall f a i. (Language f, Ord a) => (f a -> a) -> BG f i (IntMap (Weighted f a))
+extractBee :: forall f a i. (Language f, Ord a) => (f a -> a) -> BG f (IntMap (Weighted f (a, Id)))
 extractBee weigh = do
   get >>= (nodes . traversed . shape . traversed $ canonicalize)
   graph <- get
@@ -214,7 +220,7 @@ extractBee weigh = do
   let f = executingState graph' (fixpoint (const propagate) ())
   pure (mapMaybe _minTree f)
   where
-    update :: Cofree f a -> Extractor f a -> Id -> AccumT Any (State (IntMap (Extractor f a))) ()
+    update :: Cofree f (a, Id) -> Extractor f a -> Id -> AccumT Any (State (IntMap (Extractor f a))) ()
     update tree node index' = when (((\tree' -> extract tree < extract tree') <$> node ^. minTree) /= Just False) $
       do
         lift (ix (_unId index') . minTree .= Just tree)
@@ -232,7 +238,7 @@ extractBee weigh = do
               whenJust
                 newWeighted
                 ( \f -> do
-                    let weighed = weigh (fmap extract f) :< f
+                    let weighed = (weigh (fmap (fst . extract) f), index') :< f
                     update weighed node index'
                 )
               -- propagate from above
@@ -255,16 +261,28 @@ submapBetween (l, h) m = eq
     (_less, greaterEq) = Map.split l m
     (eq, _greater) = Map.split h greaterEq
 
-queryByShape :: Language f => f () -> BG f i (Map (f Id) Id)
+queryByShape :: Language f => f () -> BG f (Map (f Id) Id)
 queryByShape shape' =
   submapBetween (shape' $> Id minBound, shape' $> Id maxBound) <$> use shapes
 
-data LeapVal
-  = Some Id
-  | End
-  deriving (Eq, Ord, Show)
+data Foo a
+  = F a a
+  | G Int
+  deriving (Eq, Ord, Generic, Functor, Foldable, Traversable)
 
-type Leaper = Cofree ((->) (Maybe LeapVal))
+instance Hashable a => Hashable (Foo a)
+
+instance Language Foo
+
+data LeaperF k a
+  = LeaperEnd
+  | LeaperNext a a (k -> a)
+  deriving (Functor)
+
+data Ended a = KeepUp a | ForgetIt
+  deriving (Eq, Ord, Functor)
+
+type Leaper k a = Cofree (LeaperF k) (Ended a)
 
 data RingView a = RingView
   { _mini :: a,
@@ -275,35 +293,29 @@ data RingView a = RingView
 
 makeLenses ''RingView
 
+-- I swear these are exhaustive
 rotateRingL :: RingView a -> RingView a
 rotateRingL (RingView l m r) = case m of
   Empty -> RingView r Empty l
   l' :<| m' -> RingView l' (m' :|> r) l
 
--- I swear these are exhaustive
-
-triejoin :: [Leaper LeapVal] -> Leaper LeapVal
-triejoin ls = case fromList $ sortOn extract ls of
-  Empty -> coiter (const $ const End) End
+leapJoin :: forall k. Ord k => [Leaper k k] -> Leaper k k
+leapJoin ls = case fromList $ sortOn extract ls of
+  Empty -> ForgetIt :< LeaperEnd
   a :<| Empty -> a
   l :<| (m :|> r) -> go (RingView l m r)
   -- same here
   where
-    go :: RingView (Leaper LeapVal) -> Leaper LeapVal
+    go :: RingView (Leaper k k) -> Leaper k k
     go r =
       let lo = r ^. mini . _extract
           hi = r ^. maxi . _extract
+          alt f = go $ rotateRingL $ r & mini .~ f
        in if
-              | End <- lo -> coiter (const $ const End) End
-              | lo == hi ->
-                lo :< \seek ->
-                  let s = (r ^. mini . _unwrap) seek in go (rotateRingL $ r & mini .~ s)
-              | otherwise ->
-                let s = (r ^. mini . _unwrap) (Just hi) in go (rotateRingL $ r & mini .~ s)
-
-data Foo a
-  = F a a
-  | G Int
-  deriving (Eq, Ord, Generic, Functor, Foldable, Traversable)
-
-instance Hashable a => Hashable (Foo a)
+              | ForgetIt <- lo -> ForgetIt :< LeaperEnd
+              | lo == hi -> lo :< fmap alt (r ^. mini . _unwrap)
+              | otherwise -> case r ^. mini . _unwrap of
+                LeaperEnd -> ForgetIt :< LeaperEnd
+                LeaperNext _ _ leap -> case hi of
+                  KeepUp k -> alt (leap k)
+                  ForgetIt -> ForgetIt :< LeaperEnd

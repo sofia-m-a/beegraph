@@ -26,34 +26,43 @@ module Beegraph
 where
 
 import Control.Comonad (Comonad (extract))
-import Control.Comonad.Cofree (Cofree ((:<)), coiter, _extract, _unwrap)
-import Control.Lens hiding ((:<))
-import Control.Monad.Free (Free)
-import Control.Monad.Free.Church
+import Control.Comonad.Cofree (Cofree ((:<)))
+import Control.Lens hiding ((:<), (<.>))
+import Control.Monad.ST (ST, runST)
 import Control.Monad.Trans.Accum (AccumT, add, runAccumT)
-import Control.Monad.Trans.Cont (ContT (ContT), evalContT)
-import Data.Fix (Fix)
+import Data.Array.Base (newListArray)
+import Data.Array.ST (STArray)
 import Data.Foldable (maximum)
+import Data.Functor.Apply
 import Data.Functor.Classes (Show1 (liftShowsPrec), showsBinaryWith, showsUnaryWith)
 import Data.IntMap qualified as IntMap
 import Data.IntSet qualified as IntSet
 import Data.Map (dropWhileAntitone)
 import Data.Map qualified as Map
-import Data.Sequence (Seq ((:<|), (:|>)))
-import Data.Traversable (for)
+import Data.STRef (STRef, modifySTRef, newSTRef, readSTRef, writeSTRef)
 import GHC.Show (Show (showsPrec))
-import Witherable (mapMaybe)
+import Witherable (Filterable, Witherable, mapMaybe)
 import Prelude hiding (mapMaybe)
 
-class (Traversable f, Show (f Id), Ord (f Id), Hashable (f Id)) => Language f
+-- Ord and Traversable instance must be compatible
+class (Traversable f, Ord (f Id)) => Language f
 
+-- ────────────────────────────────── Id ─────────────────────────────────── --
 newtype Id = Id {_unId :: Int}
-  deriving (Eq, Ord, Show, Generic)
+  deriving (Eq, Ord, Generic)
+
+instance Show Id where
+  showsPrec p (Id y) = showsUnaryWith showsPrec "Id" p y
+
+instance Bounded Id where
+  minBound = Id 0
+  maxBound = Id maxBound
 
 instance Hashable Id
 
 makeLenses ''Id
 
+-- ───────────────────────────────── Node ────────────────────────────────── --
 data Node f = Node
   { -- union-find fields
     _ufParent :: !Id,
@@ -62,21 +71,23 @@ data Node f = Node
 
 makeLenses ''Node
 
+-- ─────────────────────────────── Beeclass ──────────────────────────────── --
 data Beeclass f = Beeclass
   { _shapes :: !(Set (f Id)),
     _parents :: !(Map (f Id) Id)
   }
 
-deriving instance Language f => Show (Beeclass f)
-
 makeLenses ''Beeclass
 
+-- ─────────────────────────────── Beegraph ──────────────────────────────── --
 data Beegraph f = Beegraph
   { -- union find: equivalence relation over beeclass-IDs
     _nodes :: !(IntMap (Node f)),
-    -- maps beeclass-IDS to beeclasses
+    -- maps beeclass-IDs to beeclasses
     _classes :: !(IntMap (Beeclass f)),
+    -- maps shapes to IDs
     _share :: !(Map (f Id) Id),
+    -- list of newly-unioned classes to process
     _worklist :: !IntSet
   }
 
@@ -90,7 +101,7 @@ emptyBee = Beegraph mempty mempty mempty mempty
 parent :: Id -> Traversal' (Beegraph f) Id
 parent i = nodes . ix (_unId i) . ufParent
 
--- union-find
+-- ────────────────────────────── Union-find ─────────────────────────────── --
 ufInsert :: BG f Id
 ufInsert = do
   n <- maybe 0 ((+ 1) . fst) . IntMap.lookupMax <$> use nodes
@@ -103,7 +114,7 @@ ufFind i = do
   if
       | Just (Node j' _) <- n,
         i /= j' -> do
-        -- chase parent pointers, path compression
+        -- chase parent pointers and compress the path
         grandparent <- preuse (nodes . ix (_unId j') . ufParent)
         for_ grandparent (\gp -> nodes . ix (_unId i) . ufParent .= gp)
         ufFind j'
@@ -120,6 +131,7 @@ ufUnion a' b' = do
       | a /= b,
         Just an <- an',
         Just bn <- bn' -> do
+        -- Union by rank
         let (larger, smaller) = if an ^. ufRank > bn ^. ufRank then (a, b) else (b, a)
         nodes . ix (_unId smaller) . ufParent .= larger
         when (an ^. ufRank == bn ^. ufRank) $
@@ -127,7 +139,7 @@ ufUnion a' b' = do
         pure (Just larger)
       | otherwise -> pure Nothing
 
--- congruence closure
+-- ────────────────────────── Congruence closure ─────────────────────────── --
 canonicalize :: Language f => f Id -> BG f (f Id)
 canonicalize = traverse ufFind
 
@@ -179,7 +191,7 @@ repair i = do
     at pNode' .= Just pClass'
   classes . ix (_unId i) . parents .= newParents
 
--- Extraction
+-- ────────────────────────────── Extraction ─────────────────────────────── --
 type Weighted f a = Cofree f a
 
 astDepth :: Foldable f => f Natural -> Natural
@@ -205,8 +217,8 @@ fixpoint f x = do
 extractBee :: forall f a. (Language f, Ord a) => (f a -> a) -> BG f (IntMap (Weighted f (a, Id)))
 extractBee weigh = do
   rebuild
-  graph <- get
-  let exGraph = fmap (\n -> Extractor (n ^. shapes) Nothing) (graph ^. classes)
+  cl <- use classes
+  let exGraph = fmap (\n -> Extractor (n ^. shapes) Nothing) cl
   let f = executingState exGraph (fixpoint (const propagate) ())
   pure (mapMaybe _minTree f)
   where
@@ -225,149 +237,210 @@ extractBee weigh = do
           whenJust (traverse _minTree s') \s ->
             update ((weigh (fmap (fst . extract) s), Id i) :< s) node (Id i)
 
+-- ──────────────────────────────── Queries ──────────────────────────────── --
 submapBetween :: Ord k => (k, k) -> Map k a -> Map k a
-submapBetween (l, h) m = eq
+submapBetween (l, h) m = center
   where
-    (_less, greaterEq) = Map.split l m
-    (eq, _greater) = Map.split h greaterEq
+    (_less, l', greaterEq) = Map.splitLookup l m
+    (eq, h', _greater) = Map.splitLookup h greaterEq
+    center = maybe id (Map.insert l) l' $ maybe id (Map.insert h) h' eq
 
+-- Int should be read to always be positive
 data Step
-  = Next
+  = Step
   | Leap Int
 
 data Leaper a
   = End
   | Continue Int a (Step -> Leaper a)
+  deriving (Functor)
 
-takeTheL :: Int -> Leaper a -> [(Int, a)]
-takeTheL 0 _ = []
-takeTheL _ End = []
-takeTheL n (Continue s a f) = (s, a) : takeTheL (n - 1) (f Next)
+instance Foldable Leaper where
+  foldMap _ End = mempty
+  foldMap f (Continue _ a k) = f a <> foldMap f (k Step)
 
-gnuCatboy :: [Int] -> Leaper Int
-gnuCatboy [] = End
-gnuCatboy (s : ss) = Continue s s \case
-  Next -> gnuCatboy ss
-  Leap k -> gnuCatboy $ dropWhile (< k) ss
+instance Applicative Leaper where
+  pure a = go 0
+    where
+      go n = Continue n a \case
+        Step -> go (n + 1)
+        Leap i -> go i
 
-nats :: Leaper (Int, Int)
-nats = go 0
-  where
-    go n = Continue n (n, n) \case
-      Leap v -> go v
-      Next -> go (n + 1)
+  End <*> _ = End
+  _ <*> End = End
+  Continue a b c <*> Continue d e f = case compare a d of
+    LT -> c (Leap d) <*> Continue d e f
+    EQ -> Continue a (b e) \step -> c step <*> Continue d e f
+    GT -> Continue a b c <*> f (Leap a)
 
-leapfrog :: Leaper a -> Leaper b -> Leaper (a, b)
-leapfrog End _ = End
-leapfrog _ End = End
-leapfrog (Continue i a f) (Continue j b g) = go (i, a, f) (j, b, g)
-  where
-    go :: (Int, a, Step -> Leaper a) -> (Int, b, Step -> Leaper b) -> Leaper (a, b)
-    go (i, a, f) (j, b, g) =
-      case compare i j of
-        EQ -> Continue i (a, b) \step -> case f step of
-          End -> End
-          Continue i' a' f' -> go (i', a', f') (j, b, g)
-        LT -> case f (Leap j) of
-          End -> End
-          Continue i' a' f' -> go (i', a', f') (j, b, g)
-        GT -> case g (Leap i) of
-          End -> End
-          Continue j' b' g' -> go (i, a, f) (j', b', g')
-
--- data RingView a = RingView
---   { _mini :: a,
---     _seq :: Seq a,
---     _maxi :: a
---   }
---   deriving (Show, Functor, Foldable, Traversable)
-
--- makeLenses ''RingView
-
--- -- I swear these are exhaustive
--- rotateRingL :: RingView a -> RingView a
--- rotateRingL (RingView l m r) = case m of
---   Empty -> RingView r Empty l
---   l' :<| m' -> RingView l' (m' :|> r) l
-
--- leapfrog :: [Leaper] -> Leaper
--- leapfrog ls = case fromList . sortOn (view _1) <$> unending of
---   Nothing -> End
---   Just Empty -> End
---   Just ((k, f) :<| Empty) -> Continue k f
---   Just (l :<| (m :|> r)) -> go (RingView l m r)
---   where
---     unending :: Maybe [(Int, Step -> Leaper)]
---     unending = for ls \case
---       End -> Nothing
---       Continue k f -> Just (k, f)
-
---     go :: RingView (Int, Step -> Leaper) -> Leaper
---     go r =
---       let lo = r ^. mini . _1
---           hi = r ^. maxi . _1
---           alt f = go $ rotateRingL $ r & mini .~ f
---        in if lo == hi
---             then Continue lo \step -> case (r ^. mini . _2) step of
---               End -> End
---               Continue n f -> alt (n, f)
---             else case (r ^. mini . _2) (Leap hi) of
---               End -> End
---               Continue n f -> alt (n, f)
-
--- data Shaped f a = Shaped (f a) a
---   deriving (Functor, Foldable, Traversable)
-
--- queryByShape :: forall f. Language f => f () -> BG f Leaper
--- queryByShape f = do
---   m <- submapBetween (f $> Id minBound, f $> Id maxBound) <$> use share
---   pure (go 0 m)
---   where
---     go :: Int -> Map (f Id) Id -> Leaper
---     go depth m = case Map.minViewWithKey m of
---       Nothing -> End
---       Just ((f'', i''), m') ->
---         let s = Shaped f'' i''
---          in case s ^? elementOf traverse depth of
---               Nothing -> End
---               Just i' ->
---                 Continue
---                   (_unId i')
---                   ( \case
---                       Next -> go depth m'
---                       Leap n ->
---                         let Shaped f' _i = s & elementOf traverse depth .~ Id n
---                          in go depth (dropWhileAntitone (< f') m')
---                       StepIn -> go (depth + 1) m'
---                       StepOut -> go (depth - 1) m'
---                   )
-
--- triejoin :: [Leaper] -> Leaper
--- triejoin = _
+instance Alternative Leaper where
+  empty = End
+  End <|> a = a
+  a <|> End = a
+  Continue a b c <|> Continue d e f = case compare a d of
+    LT -> Continue a b \case
+      Step -> c Step <|> Continue d e f
+      Leap n -> c (Leap n) <|> f (Leap n)
+    EQ -> Continue a b \case
+      Step -> Continue d e f <|> c Step
+      Leap n -> c (Leap n) <|> f (Leap n)
+    GT -> Continue d e \case
+      Step -> c Step <|> Continue d e f
+      Leap n -> c (Leap n) <|> f (Leap n)
 
 {-
-  given
-  R :: Leaper
-  S :: Leaper
-  T :: Leaper
-  we want to do
-
-  leapfrog [R, T] -> Q
-  leapFrog Q
+  key(&self) -> Maybe<Key>
+  next(&mut self)
+  leap(&mut self, Key)
 -}
+-- data Leaper s = Leaper
+--   { _key :: ST s (Maybe Int),
+--     _next :: Step -> ST s ()
+--   }
 
--- data Foo a
---   = H a a
---   | G Int
---   deriving (Eq, Ord, Show, Generic, Functor, Foldable, Traversable)
+-- makeLenses ''Leaper
 
--- instance Hashable a => Hashable (Foo a)
+-- nats :: ST s (Leaper s)
+-- nats = go <$> newSTRef 0
+--   where
+--     go ref = Leaper (Just <$> readSTRef ref) \case
+--       Next -> do
+--         modifySTRef ref (+ 1)
+--       Leap m -> do
+--         writeSTRef ref m
 
--- instance Language Foo
+-- take10 :: (forall s. ST s (Leaper s)) -> [Int]
+-- take10 l = runST (go 10 =<< l)
+--   where
+--     go :: Int -> Leaper s -> ST s [Int]
+--     go 0 _ = pure []
+--     go n l = do
+--       k <- l ^. key
+--       case k of
+--         Nothing -> pure []
+--         Just s -> do
+--           l ^. next $ Next
+--           ss <- go (n - 1) l
+--           pure (s : ss)
 
--- instance Show1 Foo where
---   liftShowsPrec sp sl p (H a b) = showsBinaryWith sp sp "F" p a b
---   liftShowsPrec sp sl p (G i) = showsUnaryWith showsPrec "G" p i
+-- leapfrog :: [Leaper s] -> ST s (Leaper s)
+-- leapfrog ls = do
+--   keys <- traverse (^. key) ls
+--   case sequence keys of
+--     Nothing -> pure $ Leaper (pure Nothing) (\_ -> pure ())
+--     Just ks -> do
+--       let list = map snd $ sortOn fst $ zip ks ls
+--       array <- newListArray (0, length list) list
+--       p <- newSTRef 0
+--       go array p
+--   where
+--     go :: STArray s Int (Leaper s) -> STRef s Int -> ST s (Leaper s)
+--     go = _
+
+--     leapfrogSearch :: STArray s Int (Leaper s) -> STRef s Int -> ST s (Maybe Int)
+--     leapfrogSearch = do
+
+-- data Leaper a
+--   = End
+--   | Continue Int a (Step -> Leaper a)
+--   deriving (Functor)
+
+-- instance Filterable Leaper where
+--   mapMaybe _ End = End
+--   mapMaybe f (Continue i a g) = case f a of
+--     Nothing -> mapMaybe f (g Next)
+--     Just b -> Continue i b (mapMaybe f . g)
+
+-- instance Foldable Leaper where
+--   foldMap _ End = mempty
+--   foldMap f (Continue _ a g) = f a <> foldMap f (g Next)
+
+-- nats :: Leaper Int
+-- nats = go 0
+--   where
+--     go n = Continue n n \case
+--       Leap v -> go v
+--       Next -> go (n + 1)
+
+-- leapfrog :: Leaper a -> Leaper b -> Leaper (a, b)
+-- leapfrog End _ = End
+-- leapfrog _ End = End
+-- leapfrog (Continue i a f) (Continue j b g) = go (i, a, f) (j, b, g)
+--   where
+--     mapContinue :: ((Int, a, Step -> Leaper a) -> Leaper b) -> Leaper a -> Leaper b
+--     mapContinue _ End = End
+--     mapContinue h (Continue x y z) = h (x, y, z)
+
+--     go :: (Int, a, Step -> Leaper a) -> (Int, b, Step -> Leaper b) -> Leaper (a, b)
+--     go (gi, ga, gf) (gj, gb, gg) =
+--       case compare gi gj of
+--         EQ -> Continue gi (ga, gb) $ mapContinue (`go` (gj, gb, gg)) . gf
+--         LT -> mapContinue (`go` (gj, gb, gg)) (gf (Leap gj))
+--         GT -> mapContinue ((gi, ga, gf) `go`) (gg (Leap gi))
+
+-- data Shaped f a = Shaped (f a) a
+--   deriving (Show, Functor, Foldable, Traversable)
+
+-- termShape :: Shaped f a -> f a
+-- termShape (Shaped f _) = f
+
+-- data Jumper a
+--   = Skip a
+--   | Jumper (Leaper (Jumper a))
+--   deriving (Functor)
+
+-- abstract :: Jumper a -> Leaper (Jumper a)
+-- abstract = \case
+--   Skip _ -> End
+--   Jumper le -> le
+
+-- joinJumper :: Jumper a -> Jumper b -> Jumper (a, b)
+-- joinJumper (Skip a) (Skip b) = Skip (a, b)
+-- joinJumper (Jumper l) (Skip b) = fmap (,b) (Jumper l)
+-- joinJumper (Skip a) (Jumper m) = fmap (a,) (Jumper m)
+-- joinJumper (Jumper l) (Jumper m) = Jumper $ fmap (uncurry joinJumper) (leapfrog l m)
+
+-- queryByShape :: forall f. Language f => f () -> BG f (Jumper (Shaped f Id))
+-- queryByShape f = do
+--   m <- submapBetween (f $> Id minBound, f $> Id maxBound) <$> use share
+--   pure $ Jumper $ go 0 m
+--   where
+--     go :: Int -> Map (f Id) Id -> Leaper (Jumper (Shaped f Id))
+--     go depth m = fromMaybe End do
+--       ((f', i'), m') <- Map.minViewWithKey m
+--       let s = Shaped f' i'
+--       i <- s ^? traversed . index depth
+--       let sub =
+--             if isJust (s ^? traversed . index (depth + 1))
+--               then Jumper (go (depth + 1) (submapBetween (mini, maxi) m))
+--               else Skip s
+--           mini = termShape $ s & traversed . indices (> depth) .~ minBound
+--           maxi = termShape $ s & traversed . indices (> depth) .~ maxBound
+--           mWithout Next = maxi
+--           mWithout (Leap n) = max maxi (termShape $ s & traversed . index depth .~ Id n)
+--           mWithoutSub leap = dropWhileAntitone (<= mWithout leap) m'
+--        in pure $ Continue (_unId i) sub (go depth . mWithoutSub)
+
+-- triewalk :: Jumper a -> [a]
+-- triewalk (Skip a) = [a]
+-- triewalk (Jumper c) = concat $ go c
+--   where
+--     go End = []
+--     go (Continue _ l f) = triewalk l : go (f Next)
+
+-- ───────────────────────────── Test language ───────────────────────────── --
+data Foo a
+  = H a a
+  | G Int
+  deriving (Eq, Ord, Show, Generic, Functor, Foldable, Traversable)
+
+instance Hashable a => Hashable (Foo a)
+
+instance Language Foo
+
+instance Show1 Foo where
+  liftShowsPrec sp sl p (H a b) = showsBinaryWith sp sp "F" p a b
+  liftShowsPrec sp sl p (G i) = showsUnaryWith showsPrec "G" p i
 
 -- test :: String
 -- test = show $
@@ -376,12 +449,13 @@ leapfrog (Continue i a f) (Continue j b g) = go (i, a, f) (j, b, g)
 --     g1 <- insertBee (G 1)
 --     g2 <- insertBee (G 2)
 --     g3 <- insertBee (G 3)
---     unionBee g1 g2
 --     f1 <- insertBee (H g0 g1)
 --     f2 <- insertBee (H f1 g1)
 --     f3 <- insertBee (H f2 g1)
 --     f4 <- insertBee (H f3 g1)
---     unionBee f4 g3
 --     rebuild
---     l <- queryByShape (H () ())
---     pure (takeTheL 10 l)
+--     hxya <- queryByShape (H () ())
+--     ga <- queryByShape (G 1)
+--     let s = abstract <$> abstract hxya
+--     let y = fmap (fmap \j -> hxya `joinJumper` hxya) s
+--     pure (triewalk hxya) --(Jumper (fmap Jumper y)))

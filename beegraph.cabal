@@ -38,6 +38,7 @@ executable beegraph
     , recursion-schemes
     , relude
     , semialign
+    , semigroupoids
     , smash
     -- , sofialude
     -- , souffle-haskell

@@ -1,12 +1,14 @@
+{-# LANGUAGE TemplateHaskell #-}
+
 module BeeEff where
 
-import Beegraph (BG, Id, Language, emptyBee, insertBee, unionBee)
+import Beegraph
 import Control.Comonad.Cofree (Cofree, coiter)
 import Control.Comonad.Trans.Cofree (CofreeF ((:<)))
 import Control.Lens hiding ((:<))
+import Control.Monad.Free (MonadFree (wrap))
 import Data.Functor.Foldable (cata)
 import qualified Data.IntMap as IntMap
-import Match
 import Prettyprinter
 
 data Instruction
@@ -75,7 +77,7 @@ data Pyro a
   | PyFake Word
   deriving (Eq, Ord, Show, Generic, Functor, Foldable, Traversable)
 
-instance Hashable a => Hashable (Pyro a)
+makePrisms ''Pyro
 
 instance Language Pyro
 
@@ -173,24 +175,25 @@ weighPyro = \case
   PyStream wo wo' -> 1 + wo + 10 * wo'
   PyFindFirst wo -> 1 + wo
   PySelect wo wo' -> 1 + wo + wo'
-  PyFake _wo -> 0
+  PyFake _wo -> 10000000
 
--- analyze :: String -> Maybe (Cofree Pyro Word)
--- analyze =
---   parse
---     >=> rle
---     >>> build
---     >>> usingState emptyBee
---     >>> second (run weighPyro)
---     >>> uncurry IntMap.lookup
---     >=> evaluatingState (0 :: Word)
---       . traverse
---         ( \_weight -> do
---             s <- get
---             put (s + 1)
---             pure s
---         )
---     >>> pure
+analyze :: String -> Maybe (Cofree Pyro Word)
+analyze s = _
+  where
+    k = (rle >>> build) <$> parse s
+    j =
+      k <&> \i' -> do
+        i <- i'
+        saturate do
+          let (a : b : c : d : e : f : _) = map pure vars
+          let comm = wrap (PyAdd a b) ~> wrap (PyAdd b a)
+          let assoc = wrap (PyAdd a (wrap (PyAdd b c))) ~> wrap (PyAdd (wrap (PyAdd a b)) c)
+          _
+        pure i
+
+--   >>> usingState emptyBee
+--   >>> second (run weighPyro)
+--   >>> uncurry IntMap.lookup
 
 prettyPyro :: Cofree Pyro Word -> Doc ann
 prettyPyro = snd . prettyPyro'
@@ -204,5 +207,4 @@ prettyPyro = snd . prettyPyro'
                  else line
              )
           <> pretty name <+> "←" <+> pretty (fmap fst body)
-          -- <> line
       )

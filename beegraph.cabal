@@ -29,6 +29,7 @@ executable beegraph
     , functor-combinators
     , hashable
     , haskeline
+    , heaps
     , lens
     , mtl
     , optparse-applicative
@@ -117,7 +118,7 @@ executable beegraph
     ViewPatterns
 
   main-is:            Main.hs
-  other-modules:      Beegraph BeeEff Match
+  other-modules:      Beegraph BeeEff Relation
   cxx-options:
     -D__EMBEDDED_SOUFFLE__
     -std=c++17

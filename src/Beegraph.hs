@@ -6,6 +6,7 @@
 module Beegraph
   ( Language,
     type Id,
+    unId,
     Beeclass,
     shapes,
     Beegraph,
@@ -27,6 +28,9 @@ module Beegraph
     (~>),
     vars,
     Shaped (..),
+    Rewrite,
+    saturate,
+    Stream (..),
   )
 where
 
@@ -35,7 +39,7 @@ import Control.Comonad.Cofree (Cofree ((:<)))
 import Control.Lens hiding ((:<), (<.>))
 import Control.Monad.Free (Free, MonadFree (wrap), iterA)
 import Control.Monad.Trans.Accum (AccumT, add, runAccumT)
-import Data.Foldable (maximum)
+import Data.Foldable (Foldable (foldr1), maximum, maximumBy)
 import Data.Functor.Classes (Show1 (liftShowsPrec), showsBinaryWith, showsUnaryWith)
 import Data.IntMap qualified as IntMap
 import Data.IntSet qualified as IntSet
@@ -43,7 +47,6 @@ import Data.Map qualified as Map
 import Data.Set qualified as Set
 import Data.Set.Lens (setOf)
 import Data.Traversable (for)
-import GHC.Exts qualified as Ext
 import GHC.Show (Show (showsPrec))
 import Relation
 import Witherable (mapMaybe)
@@ -243,11 +246,13 @@ extractBee weigh = do
             update ((weigh (fmap (fst . extract) s), Id i) :< s) node (Id i)
 
 -- ──────────────────────────────── Queries ──────────────────────────────── --
-data Shaped f a = Shaped (f a) a
+data Shaped f a = Shaped {
+  _termShape :: f a,
+  _termName :: a
+  }
   deriving (Show, Functor, Foldable, Traversable)
 
-termShape :: Lens' (Shaped f a) (f a)
-termShape = lens (\(Shaped f _) -> f) (\(Shaped _ k) g -> Shaped g k)
+makeLenses ''Shaped
 
 submapBetween :: Ord k => (k, k) -> Map k a -> Map k a
 submapBetween (l, h) m = center
@@ -255,36 +260,6 @@ submapBetween (l, h) m = center
     (_less, l', greaterEq) = Map.splitLookup l m
     (eq, h', _greater) = Map.splitLookup h greaterEq
     center = maybe id (Map.insert l) l' $ maybe id (Map.insert h) h' eq
-
-queryByShape :: forall f. Language f => f () -> BG f Nary
-queryByShape s = queryBetween (s $> minBound, s $> maxBound) (length s)
-
-queryBetween :: forall f. Language f => (f Id, f Id) -> Int -> BG f Nary
-queryBetween bounds limit = use share <&> go 0 . submapBetween bounds
-  where
-    go :: Int -> Map (f Id) Id -> Nary
-    go depth _ | depth > limit = Never
-    go depth m =
-      let l = rel depth m
-       in Nary (fromList (map fst l)) (\i -> maybe Never (go (depth + 1)) (Map.fromList l ^? ix i))
-
-    rel depth m =
-      Map.toAscList m
-        & mapMaybe
-          ( (\(a, b) -> (,b) <$> a)
-              . ( preview (traversed . index depth . unId)
-                    &&& \s ->
-                      submapBetween
-                        ( view termShape (s & traversed . indices (> depth) .~ minBound),
-                          view termShape (s & traversed . indices (> depth) .~ maxBound)
-                        )
-                        m
-                )
-              . uncurry Shaped
-          )
-
-equ :: Nary
-equ = Nary [0 .. 8] (\i -> Nary [i] (const Never))
 
 newtype Var = Var {_unVar :: Word} deriving (Eq, Ord, Show)
 
@@ -299,59 +274,81 @@ vars = fmap Var (go 0)
   where
     go n = n :& go (n + 1)
 
-type Equ = (Var, Var)
+queryByShape :: forall f. Language f => Shaped f Var -> BG f Rel
+queryByShape f = query ((f ^. termShape) $> minBound, (f ^. termShape) $> maxBound) f
+
+query :: forall f. Language f => (f Id, f Id) -> Shaped f Var -> BG f Rel
+query (a, b) f = use share <&> ifoldr go Null . submapBetween (a, b)
+  where
+    go :: f Id -> Id -> Rel -> Rel
+    go k v r =
+      let shaped = Shaped k v
+          zipped = zip (toList shaped) (toList f)
+          sorted = sortOn snd zipped
+          dedup ((i, a') : (j, b') : xs) | a' == b' = if i == j then dedup ((j, b') : xs) else Nothing
+          dedup ((i, a') : xs) = ((i, a') :) <$> dedup xs
+          dedup [] = Just []
+          dedupped = dedup sorted
+          insert [] rel = rel
+          insert (x : xs) Null = Nary (fromList [(x, insert xs Null)])
+          insert (x : xs) (Nary m) = Nary $ Map.insert x (insert xs (fromMaybe Null $ Map.lookup x m)) m
+       in maybe r (\xs -> insert (fmap (^. _1 . unId) xs) r) dedupped
 
 data Matcher f = Matcher
-  { _atoms :: [([Var], BG f Nary)]
+  {
+    _atoms :: [([Var], BG f Rel)],
+    _matchKeep :: [Bool]
   }
 
-runMatcher :: Matcher f -> BG f Nary
-runMatcher (Matcher atoms) = do
-  atoms' <- traverse (\(vs, f) -> (vs,) <$> f) atoms
-  let vars' = setOf (folded . _1 . folded) atoms'
-  pure $ go vars' atoms'
+makeLenses ''Matcher
+
+matcher :: Language f => Free f Var -> (Matcher f, Var)
+matcher lhs = (Matcher atoms' keep,  lhsHead)
   where
-    go :: Set Var -> [([Var], Nary)] -> Nary
+    freshVar = Var $ maybe 0 (+ 1) $ maximumOf folded $ fmap (^. unVar) lhs
+    (lhsHead, (_freshVar', atoms')) = usingState (freshVar, []) $ flip iterA lhs \f -> do  
+      seq <- sequence f
+      _2 <>= foldMap (const []) seq
+      var <- use _1
+      _1 . unVar += 1
+      let f = Shaped seq var
+      _2 %= cons (toList f, queryByShape f)
+      pure var
+    keep = (toList lhs $> True) ++ ([freshVar ^. unVar .. lhsHead ^. unVar - 1] $> False) ++ [True]
+
+runMatcher :: Matcher f -> BG f Rel
+runMatcher (Matcher atoms' _) = do
+  atoms'' <- traverse (\(vs, f) -> (vs,) <$> f) atoms'
+  let vars' = setOf (folded . _1 . folded) atoms''
+  pure $ go vars' (atoms'' <&> _1 %~ fromList)
+  where
+    go :: Set Var -> [(Set Var, Rel)] -> Rel
     go vs xs = case Set.minView vs of
-      Nothing -> Never
+      Nothing -> Null
       Just (v, vs') ->
-        let rels = xs ^.. folded . filtered (\x -> (x ^? _1 . _head) == Just v) . _2 . _Nary . _1
-            joined = conjoin rels
+        let rels = xs ^.. folded . filtered (\x -> (x ^. _1 . to Set.lookupMin) == Just v) . _2 . _Nary
+            joined = maybe mempty Map.keys (foldr1 Map.intersection <$> nonEmpty rels)
             update i =
-              xs <&> \(us, n) -> case us ^? _Cons of
+              xs <&> \(us, n) -> case Set.minView us of
                 Just (u, us')
                   | u == v ->
                     ( us',
                       case n of
-                        Never -> Never
-                        Nary _ k -> k i
+                        Null -> Null
+                        Nary m -> fromMaybe Null $ Map.lookup i m
                     )
                 _ -> (us, n)
-         in Nary joined (go vs' . update)
+         in Nary (fromList $ (\i -> (i, go vs' (update i))) <$> joined)
 
-matcher :: Language f => Free f Var -> (Matcher f, Var)
-matcher lhs =
-  let freshVar = Var $ maybe 0 (+ 1) $ maximumOf (traverse . unVar) lhs
-      (lhsHead, (equs, _freshVar', flattenedLHS)) = usingState (mempty :: Set Equ, freshVar, [] :: [Shaped f Var]) $ flip iterA lhs \f -> do
-        flatF <- sequence f
-        flatF' <- evaluatingStateT Nothing $ for flatF \v -> do
-          prev <- get
-          if
-              | Just u <- prev,
-                v <= u -> do
-                var' <- lift $ use _2
-                lift $ _2 . unVar += 1
-                lift (_1 . at (v, var') .= Just ())
-                put (Just var')
-                pure var'
-              | otherwise -> put (Just v) >> pure v
-        var <- use _2
-        _2 . unVar += 1
-        let sh = Shaped flatF' var
-        _3 %= cons sh
-        pure var
-      atoms = fmap (toList &&& queryByShape . void . view termShape) flattenedLHS ++ fmap (\(a, b) -> ([a, b], pure equ)) (toList equs)
-   in (Matcher atoms, lhsHead)
+extractMatcher :: forall b. Ord b => Rel -> [Bool] -> ([Int] -> Maybe b) -> Set b
+extractMatcher r v o = go [] v r
+  where
+    go :: [Int] -> [Bool] -> Rel -> Set b
+    go ss [] Null = maybe mempty Set.singleton (o $ reverse ss)
+    go _ss _ Null = mempty
+    go _ss [] (Nary _) = mempty
+    go ss (False : bs) (Nary m) = ifoldMap (\_i re -> go ss bs re) m
+    go ss (True : bs) (Nary m) = ifoldMap (\i re -> go (i : ss) bs re) m
 
 data Rewrite f = Rewrite
   { _lhs :: Matcher f,
@@ -359,61 +356,35 @@ data Rewrite f = Rewrite
     _rhs :: Free f Var
   }
 
+makeLenses ''Rewrite
+
 (~>) :: Language f => Free f Var -> Free f Var -> Rewrite f
-(~>) lhs rhs = Rewrite m h rhs where (m, h) = matcher lhs
+(~>) lhs = Rewrite m h where (m, h) = matcher lhs
+
+runRewrite :: (Show (f Id), Language f) => Rel -> Var -> [Bool] -> Free f Var -> AccumT Any (State (Beegraph f)) ()
+runRewrite rel lhsHead keep rhs = do
+  let rvars = toListOf folded rhs ++ [lhsHead]
+  let results = extractMatcher rel keep (Just . Map.fromList . zip rvars)
+  for_ results \result -> do
+    let substituted = for rhs (`Map.lookup` result)
+    let ltop = Map.lookup lhsHead result
+    for_ (liftA2 (,) substituted ltop) \(subs, ltop') -> do
+      rtop <- iterA (sequence >=> (lift . insertBee)) (fmap Id subs)
+      (l', r') <- liftA2 (,) (lift $ findBee $ Id ltop') (lift $ findBee rtop)
+      when (l' /= r') do
+        _ <- lift $ unionBee l' r'
+        add (Any True)
 
 -- ────────────────────────── Equality saturation ────────────────────────── --
--- saturate :: forall f. Language f => BG f (Jumper (Shaped f Id)) -> BG f ()
--- saturate query = fixpoint (const go) ()
---   where
---     go :: AccumT Any (State (Beegraph f)) ()
---     go = do
---       j <- lift query
---       for_ j \(Shaped f i) -> do
---         new <- lift $ insertBee f
---         _ <- lift $ unionBee new i
---         add (Any True)
-
--- ───────────────────────────── Test language ───────────────────────────── --
-data Foo a
-  = H a a
-  | J a
-  | G Int
-  deriving (Eq, Ord, Show, Generic, Functor, Foldable, Traversable)
-
-makePrisms ''Foo
-
-instance Language Foo
-
-instance Show1 Foo where
-  liftShowsPrec sp sl p (H a b) = showsBinaryWith sp sp "H" p a b
-  liftShowsPrec sp sl p (J a) = showsUnaryWith sp "J" p a
-  liftShowsPrec sp sl p (G i) = showsUnaryWith showsPrec "G" p i
-
-test :: String
-test = id $
-  evaluatingState emptyBee $ do
-    g0 <- insertBee (G 0)
-    g1 <- insertBee (G 1)
-    g2 <- insertBee (G 2)
-    g3 <- insertBee (G 3)
-    f1 <- insertBee (H g0 g1)
-    f2 <- insertBee (H f1 g1)
-    f3 <- insertBee (H f2 g1)
-    f4 <- insertBee (H f3 g1)
-    f5 <- insertBee (H g3 g3)
-    j0 <- insertBee (J g0)
-    j1 <- insertBee (J g1)
-    j2 <- insertBee (J g2)
-    j3 <- insertBee (J j2)
-    rebuild
-    let (a :& b :& c :& _) = fmap pure vars
-    let (m, _) = matcher (wrap (H (wrap $ H a b) c))
-    nary <- runMatcher m
-    pure (debugTree nary)
-
-foo :: [[Word]]
-foo = fmap (fmap _unVar) $ map fst $ _atoms $ fst m
-  where
-    (a :& b :& c :& _) = fmap pure vars
-    m = matcher (wrap (H (wrap $ H a b) c))
+saturate :: forall f. (Show (f Id), Language f) => [Rewrite f] -> BG f ()
+saturate rws =
+  fixpoint
+    ( const $ do
+        -- get matches
+        rels <- lift $ traverse (runMatcher . view lhs) rws
+        -- apply substitution
+        zipWithM_ (\rel rw -> runRewrite rel (rw ^. lhsHead) (rw ^. lhs . matchKeep) (rw ^. rhs)) rels rws
+        -- rebuild
+        lift rebuild
+    )
+    ()

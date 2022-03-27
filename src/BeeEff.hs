@@ -3,12 +3,16 @@
 module BeeEff where
 
 import Beegraph
-import Control.Comonad.Cofree (Cofree, coiter)
+import Control.Comonad (Comonad (extract))
+import Control.Comonad.Cofree (Cofree, ComonadCofree (unwrap), coiter)
 import Control.Comonad.Trans.Cofree (CofreeF ((:<)))
 import Control.Lens hiding ((:<))
 import Control.Monad.Free (MonadFree (wrap))
 import Data.Functor.Foldable (cata)
 import qualified Data.IntMap as IntMap
+import qualified Data.Set as Set
+import Data.Set.Lens (setOf)
+import qualified Data.Witherable as F
 import Prettyprinter
 
 data Instruction
@@ -177,34 +181,30 @@ weighPyro = \case
   PySelect wo wo' -> 1 + wo + wo'
   PyFake _wo -> 10000000
 
-analyze :: String -> Maybe (Cofree Pyro Word)
-analyze s = _
+analyze :: String -> Maybe (Id, IntMap (Weighted Pyro (Word, Id)))
+analyze s = parse s <&> ((rle >>> build >=> (<$ saturate rewrites) >=> (\j' -> (j',) <$> extractBee weighPyro)) >>> evaluatingState emptyBee)
   where
-    k = (rle >>> build) <$> parse s
-    j =
-      k <&> \i' -> do
-        i <- i'
-        saturate do
-          let (a : b : c : d : e : f : _) = map pure vars
-          let comm = wrap (PyAdd a b) ~> wrap (PyAdd b a)
-          let assoc = wrap (PyAdd a (wrap (PyAdd b c))) ~> wrap (PyAdd (wrap (PyAdd a b)) c)
-          _
-        pure i
+    rewrites =
+      let (a'' :& _) = vars
+          (a :& b :& c :& d :& e :& f :& _) = fmap pure vars
+       in [ -- addition is associative and commutative and unital
+            wrap (PyAdd a b) ~> wrap (PyAdd b a),
+            wrap (PyAdd a (wrap (PyAdd b c))) ~> wrap (PyAdd (wrap (PyAdd a b)) c),
+            wrap (PyAdd (wrap $ PyInt 0) b) ~> b,
+            --wrap (PyAdd (pure $ Right (PyInt minBound, PyInt maxBound, Shaped (PyInt 0) a'')) (pure $ Right (PyInt minBound, PyInt maxBound, Shaped (PyInt 0) a''))) ~> _,
+            -- the zero array is filled with 0s
+            wrap (PyLoad (wrap PyZeroArray) b) ~> wrap (PyInt 0)
+          ]
 
---   >>> usingState emptyBee
---   >>> second (run weighPyro)
---   >>> uncurry IntMap.lookup
-
-prettyPyro :: Cofree Pyro Word -> Doc ann
-prettyPyro = snd . prettyPyro'
+prettyPyro :: Id -> IntMap (Weighted Pyro (a, Id)) -> Doc ann
+prettyPyro i m = IntMap.lookup (i ^. unId) m' & maybe mempty go
   where
-    prettyPyro' :: Cofree Pyro Word -> (Word, Doc ann)
-    prettyPyro' = cata \(name :< body) ->
-      ( name,
-        vsep (toList $ fmap snd body)
-          <> ( if null (toList body)
-                 then mempty
-                 else line
-             )
-          <> pretty name <+> "←" <+> pretty (fmap fst body)
-      )
+    m' = fmap (fmap snd) m
+    extract' :: Functor f => Cofree f a -> (a, f a)
+    extract' f = (extract f, fmap extract (unwrap f))
+    go :: Cofree Pyro Id -> Doc ann
+    go gr =
+      let vars' :: Set Id = cata (\(name :< body) -> one name <> fold body) gr
+       in Set.map (\v -> IntMap.lookup (v ^. unId) m' & fmap extract') vars' & sequence . toList & maybe mempty (foldMap pr . Set.fromList)
+    pr :: (Id, Pyro Id) -> Doc ann
+    pr (name, body) = pretty (name ^. unId) <+> "←" <+> pretty (fmap (^. unId) body) <> hardline

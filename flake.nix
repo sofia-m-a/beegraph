@@ -1,6 +1,5 @@
-
 {
-  description = "pltest";
+  description = "beegraph";
   inputs = {
     nixpkgs.url = "github:nixos/nixpkgs/a3d847c3bd3a3b75b3057d7b3730d3308dd8fd59";
     flake-utils.url = "github:numtide/flake-utils";
@@ -9,21 +8,23 @@
       flake = false;
     };
     souffle-haskell.url = "github:luc-tielen/souffle-haskell";
+    sofialude.url = "github:sofia-m-a/sofialude";
   };
-  outputs = inputs@{ self, nixpkgs, flake-utils, souffle-haskell, ... }:
+  outputs = inputs@{ self, nixpkgs, flake-utils, souffle-haskell, sofialude, ... }:
     flake-utils.lib.eachSystem [ "x86_64-linux" "x86_64-darwin" "aarch64-darwin" ] (system:
       let
         overlays = [ ]
           ++ souffle-haskell.overlays.${system} # bring in souffle/souffle-haskell
-          ++ [ (self: super: {
-                 haskellPackages = super.haskellPackages.override {
-                   overrides = hself: hsuper: {
-                     souffle-haskell = super.souffle-haskell;
-                   };
-                 };
-               })
-             ] # this overlay is necessary because github:luc-tielen/souffle-haskell doesn't stick these in haskellPackages
-          ;
+          ++ [
+          (self: super: {
+            haskellPackages = super.haskellPackages.override {
+              overrides = hself: hsuper: {
+                souffle-haskell = super.souffle-haskell;
+              };
+            };
+          })
+        ] # this overlay is necessary because github:luc-tielen/souffle-haskell doesn't stick these in haskellPackages
+        ;
         pkgs =
           import nixpkgs { inherit system overlays; config.allowBroken = true; };
 
@@ -45,11 +46,11 @@
         project = returnShellEnv:
           pkgs.haskellPackages.developPackage {
             inherit returnShellEnv;
-            name = "pltest";
+            name = "beegraph";
             root = ./.;
             withHoogle = false;
             overrides = self: super: with pkgs.haskell.lib; {
-
+              sofialude = self.callPackage sofialude { };
             };
             modifier = drv:
               pkgs.haskell.lib.addBuildTools drv

@@ -25,33 +25,39 @@ module Beegraph
     astSize,
     extractBee,
     -- todo
+    Shaped(..),
+    Var,
+    Query(..),
+    queryTree,
+    wildcard,
+    runQuery,
     (~>),
-    vars,
-    Shaped (..),
     Rewrite,
     saturate,
-    Stream (..),
+    debugclass
   )
 where
 
 import Control.Comonad (Comonad (extract))
 import Control.Comonad.Cofree (Cofree ((:<)))
 import Control.Lens hiding ((:<), (<.>))
-import Control.Monad.Free (Free, MonadFree (wrap), iterA)
+import Control.Monad.Free (Free (Pure, Free), iterA)
 import Control.Monad.Trans.Accum (AccumT, add, runAccumT)
-import Data.Foldable (Foldable (foldr1), maximum, maximumBy)
-import Data.Functor.Classes (Show1 (liftShowsPrec), showsBinaryWith, showsUnaryWith)
+import Data.Deriving (deriveShow1)
+import Data.Foldable (maximum)
+import Data.Functor.Classes (Show1, showsUnaryWith, showsPrec1)
 import Data.IntMap qualified as IntMap
 import Data.IntSet qualified as IntSet
 import Data.Map qualified as Map
-import Data.Set qualified as Set
-import Data.Set.Lens (setOf)
-import Data.Traversable (for)
 import GHC.Show (Show (showsPrec))
 import Relation
 import Witherable (mapMaybe)
 import Prelude hiding (mapMaybe)
-
+import qualified GHC.Exts as Ext
+import Data.Traversable (for)
+import qualified Data.IntSet.Lens as IntSet
+import qualified Data.Set as Set
+import qualified Data.Set.Lens as Set
 -- Ord and Traversable instance must be compatible
 class (Traversable f, Ord (f Id)) => Language f
 
@@ -76,25 +82,34 @@ data Node f = Node
     _ufParent :: !Id,
     _ufRank :: !Word16
   }
+  deriving (Show)
 
 makeLenses ''Node
 
 -- ─────────────────────────────── Beeclass ──────────────────────────────── --
+type BeeNode f = f Id
+
 data Beeclass f = Beeclass
-  { _shapes :: !(Set (f Id)),
-    _parents :: !(Map (f Id) Id)
+  { _shapes :: !(Set (BeeNode f)),
+    _parents :: !(Seq (BeeNode f, Id))
   }
 
 makeLenses ''Beeclass
 
+instance Language f => Semigroup (Beeclass f) where
+  Beeclass s p <> Beeclass t q = Beeclass (s <> t) (p <> q)
+
+debugclass :: Show (f Id) => Beeclass f -> String
+debugclass (Beeclass s p) = show s <> " & p: " <> show p
+
 -- ─────────────────────────────── Beegraph ──────────────────────────────── --
 data Beegraph f = Beegraph
-  { -- union find: equivalence relation over beeclass-IDs
+  { -- union find: equivalence relation over beenode-IDs
     _nodes :: !(IntMap (Node f)),
-    -- maps beeclass-IDs to beeclasses
+    -- maps beenode-IDs to beeclasses
     _classes :: !(IntMap (Beeclass f)),
     -- maps shapes to IDs
-    _share :: !(Map (f Id) Id),
+    _share :: !(Map (BeeNode f) Id),
     -- list of newly-unioned classes to process
     _worklist :: !IntSet
   }
@@ -148,56 +163,63 @@ ufUnion a' b' = do
       | otherwise -> pure Nothing
 
 -- ────────────────────────── Congruence closure ─────────────────────────── --
+findBee :: Language f => Id -> BG f Id
+findBee = ufFind
+
 canonicalize :: Language f => f Id -> BG f (f Id)
-canonicalize = traverse ufFind
+canonicalize = traverse findBee
 
 insertBee :: Language f => f Id -> BG f Id
 insertBee f = do
   g <- canonicalize f
   m <- use (share . at g)
-  whenNothing m do
+  j <- whenNothing m do
     i <- ufInsert
-    for_ g \j -> classes . ix (_unId j) . parents . at g .= Just i
-    classes . at (_unId i) .= Just (Beeclass (one g) mempty)
     share . at g .= Just i
+    classes . at (_unId i) .= Just (Beeclass (one g) mempty)
+    for_ g \j -> classes . ix (_unId j) . parents <>= one (g, i)
     pure i
+  findBee j
 
-findBee :: Language f => Id -> BG f Id
-findBee = ufFind
-
-unionBee :: Language f => Id -> Id -> BG f Id
+unionBee :: Language f => Id -> Id -> BG f (Maybe Id)
 unionBee a b = do
   u <- ufUnion a b
-  if
-      | Just u' <- u -> do
-        worklist . at (_unId u') .= Just ()
-        pure u'
-      | Nothing <- u -> pure a
+  case u of
+      Just u' -> do
+        pa <- use (classes . at (a ^. unId))
+        pb <- use (classes . at (b ^. unId))
+        let p = pa <> pb
+        classes . at (a ^. unId) .= Nothing
+        classes . at (b ^. unId) .= Nothing
+        classes . at (u' ^. unId) .= p
+        worklist <>= one (u' ^. unId)
+        pure (Just u')
+      Nothing -> pure Nothing
 
-rebuild :: Language f => BG f ()
+rebuild :: (Show (f Id), Language f) => BG f ()
 rebuild = do
   w <- use worklist
   when (IntSet.size w /= 0) do
     worklist .= mempty
     todo :: IntSet <- fmap (fromList . fmap _unId) . traverse (findBee . Id) . IntSet.toList $ w
-    for_ (IntSet.toList todo) (repair . Id)
+    forOf_ IntSet.members todo (repair . Id)
     rebuild
 
-repair :: Language f => Id -> BG f ()
+repair :: forall f. Language f => Id -> BG f ()
 repair i = do
   p <- use (classes . ix (_unId i) . parents)
-  ifor_ p \pNode pClass -> do
+  for_ p \(pNode, pClass) -> do
     share . at pNode .= Nothing
     pNode' <- canonicalize pNode
     pClass' <- findBee pClass
     share . at pNode' .= Just pClass'
-  newParents <- executingStateT mempty $ ifor_ p \pNode pClass -> do
+  newParents <- executingStateT mempty $ for_ p \(pNode, pClass) -> do
     pNode' <- lift $ canonicalize pNode
     isNew <- use (at pNode')
     whenJust isNew (void . lift . unionBee pClass)
     pClass' <- lift $ findBee pClass
     at pNode' .= Just pClass'
-  classes . ix (_unId i) . parents .= newParents
+  classes . ix (_unId i) . parents .= fromList (Map.toList newParents)
 
 -- ────────────────────────────── Extraction ─────────────────────────────── --
 type Weighted f a = Cofree f a
@@ -222,11 +244,13 @@ fixpoint f x = do
     then fixpoint f out
     else pure out
 
-extractBee :: forall f a. (Language f, Ord a) => (f a -> a) -> BG f (IntMap (Weighted f (a, Id)))
+extractBee :: forall f a. (Show (f Id), Language f, Ord a) => (f a -> a) -> BG f (IntMap (Weighted f (a, Id)))
 extractBee weigh = do
   rebuild
   cl <- use classes
-  let exGraph = fmap (\n -> Extractor (n ^. shapes) Nothing) cl
+  exGraph <- for cl \n -> do
+    n' <- fromList <$> traverse canonicalize (toList (n ^. shapes))
+    pure $ Extractor n' Nothing
   let f = executingState exGraph (fixpoint (const propagate) ())
   pure (mapMaybe _minTree f)
   where
@@ -250,9 +274,37 @@ data Shaped f a = Shaped {
   _termShape :: f a,
   _termName :: a
   }
-  deriving (Show, Functor, Foldable, Traversable)
+  deriving (Functor, Foldable, Traversable)
 
 makeLenses ''Shaped
+
+deriveShow1 ''Shaped
+
+instance (Show1 f, Show a) => Show (Shaped f a) where showsPrec = showsPrec1
+
+type Var = Word
+
+data Query f
+  = QueryVar Var
+  | QueryShaped (Shaped f Var)
+  | QueryJoin Word [Query f]
+  deriving (Show)
+
+queryTree :: forall f. Language f => Free f Word -> (Var, Query f)
+queryTree f = second optimize $ evaluatingState freshVar $ go f
+  where
+    freshVar = maybe 0 (1 +) $ maximumOf folded f
+
+    go (Pure w) = pure (w, QueryVar w)
+    go (Free f') = do
+      f'' <- traverse go f'
+      h <- id <<+= 1
+      pure (h, foldr (\(j, q) p -> QueryJoin j [q, p]) (QueryShaped $ Shaped (fmap fst f'') h) (toList f''))
+
+    optimize :: Query f -> Query f
+    optimize (QueryJoin w [QueryVar w', x]) | w == w' = optimize x
+    optimize (QueryJoin k ss) = QueryJoin k (fmap optimize ss)
+    optimize q = q
 
 submapBetween :: Ord k => (k, k) -> Map k a -> Map k a
 submapBetween (l, h) m = center
@@ -261,129 +313,76 @@ submapBetween (l, h) m = center
     (eq, h', _greater) = Map.splitLookup h greaterEq
     center = maybe id (Map.insert l) l' $ maybe id (Map.insert h) h' eq
 
-newtype Var = Var {_unVar :: Word} deriving (Eq, Ord, Show)
+wildcard :: BG f Rel
+wildcard = use share <&> (Map.elems >>> fmap (^. unId) >>> sort >>> fromList)
 
-makeLenses ''Var
-
-data Stream a = a :& Stream a deriving (Functor)
-
-infixr 5 :&
-
-vars :: Stream Var
-vars = fmap Var (go 0)
+runQuery :: forall f. Language f => Rel -> Query f -> BG f (Nary Var)
+-- a unary relation. We take a pre-calculated wildcard Rel in as an optimization
+runQuery i (QueryVar w) = pure $ Nary w i (const Nullary)
+runQuery _ (QueryShaped sh) = do
+  s <- use share
+  -- first, split off the submap containing things of valid shape
+  let s' = submapBetween (sh ^. termShape $> minBound, sh ^. termShape $> maxBound) s
+  pure $ toNary $ ifoldr go SetNullary s'
   where
-    go n = n :& go (n + 1)
-
-queryByShape :: forall f. Language f => Shaped f Var -> BG f Rel
-queryByShape f = query ((f ^. termShape) $> minBound, (f ^. termShape) $> maxBound) f
-
-query :: forall f. Language f => (f Id, f Id) -> Shaped f Var -> BG f Rel
-query (a, b) f = use share <&> ifoldr go Null . submapBetween (a, b)
+    -- then group each Id with the variable it corresponds to,
+    -- and sort by the variables
+    -- and insert into the n-ary relation
+    go :: f Id -> Id -> SetNary Var -> SetNary Var
+    go f i n = foldr (\(v, Id i) -> setInsert v i) n $ sortOn fst $ zip (toList sh) (toList (Shaped f i))
+runQuery i (QueryJoin w qs) = do
+  qs' <- traverse (runQuery i) qs
+  pure $ go qs' []
   where
-    go :: f Id -> Id -> Rel -> Rel
-    go k v r =
-      let shaped = Shaped k v
-          zipped = zip (toList shaped) (toList f)
-          sorted = sortOn snd zipped
-          dedup ((i, a') : (j, b') : xs) | a' == b' = if i == j then dedup ((j, b') : xs) else Nothing
-          dedup ((i, a') : xs) = ((i, a') :) <$> dedup xs
-          dedup [] = Just []
-          dedupped = dedup sorted
-          insert [] rel = rel
-          insert (x : xs) Null = Nary (fromList [(x, insert xs Null)])
-          insert (x : xs) (Nary m) = Nary $ Map.insert x (insert xs (fromMaybe Null $ Map.lookup x m)) m
-       in maybe r (\xs -> insert (fmap (^. _1 . unId) xs) r) dedupped
-
-data Matcher f = Matcher
-  {
-    _atoms :: [([Var], BG f Rel)],
-    _matchKeep :: [Bool]
-  }
-
-makeLenses ''Matcher
-
-matcher :: Language f => Free f Var -> (Matcher f, Var)
-matcher lhs = (Matcher atoms' keep,  lhsHead)
-  where
-    freshVar = Var $ maybe 0 (+ 1) $ maximumOf folded $ fmap (^. unVar) lhs
-    (lhsHead, (_freshVar', atoms')) = usingState (freshVar, []) $ flip iterA lhs \f -> do  
-      seq <- sequence f
-      _2 <>= foldMap (const []) seq
-      var <- use _1
-      _1 . unVar += 1
-      let f = Shaped seq var
-      _2 %= cons (toList f, queryByShape f)
-      pure var
-    keep = (toList lhs $> True) ++ ([freshVar ^. unVar .. lhsHead ^. unVar - 1] $> False) ++ [True]
-
-runMatcher :: Matcher f -> BG f Rel
-runMatcher (Matcher atoms' _) = do
-  atoms'' <- traverse (\(vs, f) -> (vs,) <$> f) atoms'
-  let vars' = setOf (folded . _1 . folded) atoms''
-  pure $ go vars' (atoms'' <&> _1 %~ fromList)
-  where
-    go :: Set Var -> [(Set Var, Rel)] -> Rel
-    go vs xs = case Set.minView vs of
-      Nothing -> Null
-      Just (v, vs') ->
-        let rels = xs ^.. folded . filtered (\x -> (x ^. _1 . to Set.lookupMin) == Just v) . _2 . _Nary
-            joined = maybe mempty Map.keys (foldr1 Map.intersection <$> nonEmpty rels)
-            update i =
-              xs <&> \(us, n) -> case Set.minView us of
-                Just (u, us')
-                  | u == v ->
-                    ( us',
-                      case n of
-                        Null -> Null
-                        Nary m -> fromMaybe Null $ Map.lookup i m
-                    )
-                _ -> (us, n)
-         in Nary (fromList $ (\i -> (i, go vs' (update i))) <$> joined)
-
-extractMatcher :: forall b. Ord b => Rel -> [Bool] -> ([Int] -> Maybe b) -> Set b
-extractMatcher r v o = go [] v r
-  where
-    go :: [Int] -> [Bool] -> Rel -> Set b
-    go ss [] Null = maybe mempty Set.singleton (o $ reverse ss)
-    go _ss _ Null = mempty
-    go _ss [] (Nary _) = mempty
-    go ss (False : bs) (Nary m) = ifoldMap (\_i re -> go ss bs re) m
-    go ss (True : bs) (Nary m) = ifoldMap (\i re -> go (i : ss) bs re) m
+    go :: [Nary Var] -> [(Rel, Int -> Nary Var)] -> Nary Var
+    go [] ls = Nary w (conjoin (fmap fst ls)) (\i -> go (fmap (\(_, k) -> k i) ls) [])
+    go (Nullary:_ns) _ls = Nullary
+    go (Nary v rel k:ns) ls = if v == w
+      then go ns ((rel, k):ls)
+      else Nary v rel (\i -> go (k i:ns) ls)
 
 data Rewrite f = Rewrite
-  { _lhs :: Matcher f,
-    _lhsHead :: Var,
-    _rhs :: Free f Var
+  {
+    _query :: Query f,
+    _pivot :: Var,
+    _target :: Free f Var
   }
 
 makeLenses ''Rewrite
 
 (~>) :: Language f => Free f Var -> Free f Var -> Rewrite f
-(~>) lhs = Rewrite m h where (m, h) = matcher lhs
+(~>) lhs = Rewrite q v where (v, q) = queryTree lhs
 
-runRewrite :: (Show (f Id), Language f) => Rel -> Var -> [Bool] -> Free f Var -> AccumT Any (State (Beegraph f)) ()
-runRewrite rel lhsHead keep rhs = do
-  let rvars = toListOf folded rhs ++ [lhsHead]
-  let results = extractMatcher rel keep (Just . Map.fromList . zip rvars)
-  for_ results \result -> do
-    let substituted = for rhs (`Map.lookup` result)
-    let ltop = Map.lookup lhsHead result
-    for_ (liftA2 (,) substituted ltop) \(subs, ltop') -> do
-      rtop <- iterA (sequence >=> (lift . insertBee)) (fmap Id subs)
-      (l', r') <- liftA2 (,) (lift $ findBee $ Id ltop') (lift $ findBee rtop)
+extractNary :: Nary Var -> [Map Var Int]
+extractNary Nullary = [mempty]
+extractNary (Nary v rel k) = do
+  i <- Ext.toList rel
+  m <- extractNary (k i)
+  pure (one (v, i) <> m)
+
+runRewrite :: (Show1 f, Show (f Id), Language f) => Nary Var -> Free f Var -> Var -> AccumT Any (State (Beegraph f)) ()
+runRewrite nary target pivot =
+  for_ (extractNary nary) \m -> do
+    let substituted = for target (`Map.lookup` m)
+    let pivot' = pivot `Map.lookup` m
+    traceM $ "map: " <> show m <> ", subs: " <> show substituted <> ", pivot" <> show pivot'
+    for_ (liftA2 (,) substituted pivot') \(subs, p) -> do
+      top <- iterA (sequence >=> (lift . insertBee)) (fmap Id subs)
+      (l', r') <- liftA2 (,) (lift $ findBee $ Id p) (lift $ findBee top)
       when (l' /= r') do
         _ <- lift $ unionBee l' r'
         add (Any True)
 
 -- ────────────────────────── Equality saturation ────────────────────────── --
-saturate :: forall f. (Show (f Id), Language f) => [Rewrite f] -> BG f ()
+saturate :: forall f. (Show1 f, Show (f Id), Language f) => [Rewrite f] -> BG f ()
 saturate rws =
   fixpoint
     ( const $ do
+        wc <- lift wildcard
         -- get matches
-        rels <- lift $ traverse (runMatcher . view lhs) rws
+        rels <- lift $ traverse (runQuery wc . view query) rws
         -- apply substitution
-        zipWithM_ (\rel rw -> runRewrite rel (rw ^. lhsHead) (rw ^. lhs . matchKeep) (rw ^. rhs)) rels rws
+        zipWithM_ (\rel rw -> runRewrite rel (rw ^. target) (rw ^. pivot)) rels rws
         -- rebuild
         lift rebuild
     )

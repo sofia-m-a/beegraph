@@ -20,16 +20,19 @@ executable beegraph
     , assoc
     , base
     , bifunctors
+    , bound
     , bytestring
     , comonad
     , comonad-extras
     , containers
     , data-fix
+    , deriving-compat
     , free
     , functor-combinators
     , hashable
     , haskeline
     , heaps
+    , list-t
     , lens
     , mtl
     , optparse-applicative

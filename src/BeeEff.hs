@@ -7,13 +7,15 @@ import Control.Comonad (Comonad (extract))
 import Control.Comonad.Cofree (Cofree, ComonadCofree (unwrap), coiter)
 import Control.Comonad.Trans.Cofree (CofreeF ((:<)))
 import Control.Lens hiding ((:<))
-import Control.Monad.Free (MonadFree (wrap))
+import Control.Monad.Free (MonadFree (wrap), Free (Pure))
 import Data.Functor.Foldable (cata)
 import qualified Data.IntMap as IntMap
 import qualified Data.Set as Set
 import Data.Set.Lens (setOf)
 import qualified Data.Witherable as F
 import Prettyprinter
+import Data.Deriving (deriveShow1)
+import Relation (Nary)
 
 data Instruction
   = Add Int
@@ -82,6 +84,8 @@ data Pyro a
   deriving (Eq, Ord, Show, Generic, Functor, Foldable, Traversable)
 
 makePrisms ''Pyro
+
+deriveShow1 ''Pyro
 
 instance Language Pyro
 
@@ -181,12 +185,16 @@ weighPyro = \case
   PySelect wo wo' -> 1 + wo + wo'
   PyFake _wo -> 10000000
 
+s :: BG Pyro (Nary Var)
+s = do
+  r <- wildcard
+  let (w, q) = queryTree $ wrap (PyAdd (pure 0) (wrap (PyAdd (pure 1) (pure 2))))
+  runQuery r q
 analyze :: String -> Maybe (Id, IntMap (Weighted Pyro (Word, Id)))
 analyze s = parse s <&> ((rle >>> build >=> (<$ saturate rewrites) >=> (\j' -> (j',) <$> extractBee weighPyro)) >>> evaluatingState emptyBee)
   where
     rewrites =
-      let (a'' :& _) = vars
-          (a :& b :& c :& d :& e :& f :& _) = fmap pure vars
+      let [a, b, c, d, e, f] :: [Free Pyro Var] = [Pure 0, Pure 1, Pure 2, Pure 3, Pure 4, Pure 5]
        in [ -- addition is associative and commutative and unital
             wrap (PyAdd a b) ~> wrap (PyAdd b a),
             wrap (PyAdd a (wrap (PyAdd b c))) ~> wrap (PyAdd (wrap (PyAdd a b)) c),
@@ -195,6 +203,7 @@ analyze s = parse s <&> ((rle >>> build >=> (<$ saturate rewrites) >=> (\j' -> (
             -- the zero array is filled with 0s
             wrap (PyLoad (wrap PyZeroArray) b) ~> wrap (PyInt 0)
           ]
+
 
 prettyPyro :: Id -> IntMap (Weighted Pyro (a, Id)) -> Doc ann
 prettyPyro i m = IntMap.lookup (i ^. unId) m' & maybe mempty go
